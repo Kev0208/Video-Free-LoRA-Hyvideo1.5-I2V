@@ -271,14 +271,16 @@ The following table provides the optimal inference configurations (CFG scale, em
 | 480p I2V | 6 | None | 5 | 50 |
 | 720p T2V | 6 | None | 9 | 50 |
 | 720p I2V | 6 | None | 7 | 50 |
-| 480p T2V Distilled | 1 | None | 5 | 50 |
-| 480p I2V Distilled | 1 | None | 5 | 50 |
-| 720p T2V Distilled | 1 | None | 9 | 50 |
-| 720p I2V Distilled | 1 | None | 7 | 50 |
-| 720p T2V Distilled Sparse | 1 | None | 7 | 50 |
-| 720p I2V Distilled Sparse | 1 | None | 9 | 50 |
-| 480→720 SR | 1 | None | 2 | 6 |
-| 720→1080 SR | 1 | None | 2 | 8 |
+| 480p T2V CFG Distilled | 1 | None | 5 | 50 |
+| 480p I2V CFG Distilled | 1 | None | 5 | 50 |
+| 720p T2V CFG Distilled | 1 | None | 9 | 50 |
+| 720p I2V CFG Distilled | 1 | None | 7 | 50 |
+| 720p T2V CFG Distilled Sparse | 1 | None | 7 | 50 |
+| 720p I2V CFG Distilled Sparse | 1 | None | 9 | 50 |
+| 480→720 SR Step Distilled | 1 | None | 2 | 6 |
+| 720→1080 SR Step Distilled | 1 | None | 2 | 8 |
+
+**Please note that the cfg distilled model we provided, must use 50 steps to generate correct results.**
 
 
 ## 🧱 Models Cards
@@ -286,16 +288,16 @@ The following table provides the optimal inference configurations (CFG scale, em
 |-|---------------------------| 
 |HunyuanVideo-1.5-480P-T2V|[480P-T2V](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/480p_t2v) |
 |HunyuanVideo-1.5-480P-I2V |[480P-I2V](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/480p_i2v) |
-|HunyuanVideo-1.5-480P-T2V-distill | [480P-T2V-distill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/480p_t2v_distilled) |
-|HunyuanVideo-1.5-480P-I2V-distill |[480P-I2V-distill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/480p_i2v_distilled) |
+|HunyuanVideo-1.5-480P-T2V-cfg-distill | [480P-T2V-cfg-distill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/480p_t2v_distilled) |
+|HunyuanVideo-1.5-480P-I2V-cfg-distill |[480P-I2V-cfg-distill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/480p_i2v_distilled) |
 |HunyuanVideo-1.5-720P-T2V|[720P-T2V](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_t2v) |
 |HunyuanVideo-1.5-720P-I2V |[720P-I2V](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_i2v) |
-|HunyuanVideo-1.5-720P-T2V-distiill| Comming soon |
-|HunyuanVideo-1.5-720P-I2V-distiill |[720P-I2V-distiill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_i2v_distilled) |
-|HunyuanVideo-1.5-720P-T2V-sparse-distiill| Comming soon |
-|HunyuanVideo-1.5-720P-I2V-sparse-distiill |[720P-I2V-sparse-distiill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_i2v_distilled_sparse) |
-|HunyuanVideo-1.5-720P-sr |[720P-sr](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_sr_distilled) |
-|HunyuanVideo-1.5-1080P-sr |[1080P-sr](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/1080p_sr_distilled) |
+|HunyuanVideo-1.5-720P-T2V-cfg-distill| Comming soon |
+|HunyuanVideo-1.5-720P-I2V-cfg-distill |[720P-I2V-cfg-distill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_i2v_distilled) |
+|HunyuanVideo-1.5-720P-T2V-sparse-cfg-distill| Comming soon |
+|HunyuanVideo-1.5-720P-I2V-sparse-cfg-distill |[720P-I2V-sparse-cfg-distill](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_i2v_distilled_sparse) |
+|HunyuanVideo-1.5-720P-sr-step-distill |[720P-sr](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/720p_sr_distilled) |
+|HunyuanVideo-1.5-1080P-sr-step-distill |[1080P-sr](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/1080p_sr_distilled) |
 
 
 
