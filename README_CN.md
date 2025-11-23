@@ -215,11 +215,11 @@ OUTPUT_PATH=./outputs/output.mp4
 # 配置
 N_INFERENCE_GPU=8 # 并行推理 GPU 数量
 CFG_DISTILLED=true # 使用 CFG 蒸馏模型进行推理，2倍加速
-SPARSE_ATTN=false # 使用稀疏注意力进行推理
+SPARSE_ATTN=false # 使用稀疏注意力进行推理（仅 720p 模型配备了稀疏注意力）。请确保 flex-block-attn 已安装
 SAGE_ATTN=false # 使用 SageAttention 进行推理
-MODEL_PATH=ckpts # 预训练模型路径
-REWRITE=true # 启用提示词重写
+REWRITE=true # 启用提示词重写。请确保 rewrite vLLM server 已部署和配置。
 OVERLAP_GROUP_OFFLOADING=true # 仅在组卸载启用时有效，会显著增加 CPU 内存占用，但能够提速
+MODEL_PATH=ckpts # 预训练模型路径
 
 torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
   --prompt "$PROMPT" \

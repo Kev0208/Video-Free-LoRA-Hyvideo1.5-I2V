@@ -212,11 +212,11 @@ OUTPUT_PATH=./outputs/output.mp4
 # Configuration
 N_INFERENCE_GPU=8 # Parallel inference GPU count
 CFG_DISTILLED=true # Inference with CFG distilled model, 2x speedup
-SPARSE_ATTN=false # Inference with sparse attention
+SPARSE_ATTN=false # Inference with sparse attention (only 720p models are equipped with sparse attention). Please ensure flex-block-attn is installed
 SAGE_ATTN=false # Inference with SageAttention
-MODEL_PATH=ckpts # Path to pretrained model
-REWRITE=true # Enable prompt rewriting
+REWRITE=true # Enable prompt rewriting. Please ensure rewrite vLLM server is deployed and configured.
 OVERLAP_GROUP_OFFLOADING=true # Only valid when group offloading is enabled, significantly increases CPU memory usage but speeds up inference
+MODEL_PATH=ckpts # Path to pretrained model
 
 torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
   --prompt "$PROMPT" \
