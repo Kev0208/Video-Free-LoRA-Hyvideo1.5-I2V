@@ -23,6 +23,14 @@ class InferState:
     sage_blocks_range: Optional[range] = None  # block range to use SageAttention
     enable_torch_compile: bool = False  # whether to use torch compile
 
+    enable_cache: bool = False  # whether to use cache
+    cache_start_step: int = 11 # start step to skip
+    cache_end_step: int = 45 # end step to skip
+    total_steps: int = 50 # total steps
+    cache_step_interval: int = 4 # step interval to skip
+
+
+
 __infer_state = None
 
 def parse_range(value):
@@ -41,6 +49,13 @@ def initialize_infer_state(args):
         enable_sageattn = use_sageattn,
         sage_blocks_range = sage_blocks_range,
         enable_torch_compile = args.enable_torch_compile,
+
+        # cache related
+        enable_cache = args.enable_cache,
+        cache_start_step = args.cache_start_step,
+        cache_end_step = args.cache_end_step,
+        total_steps = args.total_steps,
+        cache_step_interval = args.cache_step_interval,
     )
     return __infer_state
 

@@ -219,6 +219,7 @@ SPARSE_ATTN=false # 使用稀疏注意力进行推理（仅 720p 模型配备了
 SAGE_ATTN=true # 使用 SageAttention 进行推理
 REWRITE=true # 启用提示词重写。请确保 rewrite vLLM server 已部署和配置。
 OVERLAP_GROUP_OFFLOADING=true # 仅在组卸载启用时有效，会显著增加 CPU 内存占用，但能够提速
+ENABLE_CACHE=true # 启用特征缓存进行推理。显著提升推理速度
 MODEL_PATH=ckpts # 预训练模型路径
 
 torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
@@ -230,6 +231,7 @@ torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
   --cfg_distilled $CFG_DISTILLED \
   --sparse_attn $SPARSE_ATTN \
   --use_sageattn $SAGE_ATTN \
+  --enable_cache $ENABLE_CACHE \
   --rewrite $REWRITE \
   --output_path $OUTPUT_PATH \
   --overlap_group_offloading $OVERLAP_GROUP_OFFLOADING \
@@ -273,6 +275,11 @@ torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
 | `--use_sageattn` | bool | 否 | `false` | 启用 SageAttention（使用 `--use_sageattn` 或 `--use_sageattn true/1` 来启用，`--use_sageattn false/0` 来禁用） |
 | `--sage_blocks_range` | str | 否 | `0-53` | SageAttention 块范围（例如：`0-5` 或 `0,1,2,3,4,5`） |
 | `--enable_torch_compile` | bool | 否 | `false` | 启用 torch compile 以优化 transformer（使用 `--enable_torch_compile` 或 `--enable_torch_compile true/1` 来启用，`--enable_torch_compile false/0` 来禁用） |
+| `--enable_cache` | bool | 否 | `false` | 启用 transformer 缓存（使用 `--enable_cache` 或 `--enable_cache true/1` 来启用，`--enable_cache false/0` 来禁用） |
+| `--cache_start_step` | int | 否 | `11` | 使用缓存时跳过的起始步数 |
+| `--cache_end_step` | int | 否 | `45` | 使用缓存时跳过的结束步数 |
+| `--total_steps` | int | 否 | `50` | 总推理步数 |
+| `--cache_step_interval` | int | 否 | `4` | 使用缓存时跳过的步数间隔 |
 
 **注意：** 使用 `--nproc_per_node` 指定使用的 GPU 数量。例如，`--nproc_per_node=8` 表示使用 8 个 GPU。
 

@@ -252,6 +252,28 @@ def main():
              'Use --enable_torch_compile or --enable_torch_compile true/1 to enable, '
              '--enable_torch_compile false/0 to disable'
     )
+    parser.add_argument(
+        '--enable_cache', type=str_to_bool, nargs='?', const=True, default=False,
+        help='Enable cache for transformer (default: false). '
+             'Use --enable_cache or --enable_cache true/1 to enable, '
+             '--enable_cache false/0 to disable'
+    )
+    parser.add_argument(
+        '--cache_start_step', type=int, default=11,
+        help='Start step to skip when using cache (default: 11)'
+    )
+    parser.add_argument(
+        '--cache_end_step', type=int, default=45,
+        help='End step to skip when using cache (default: 45)'
+    )
+    parser.add_argument(
+        '--total_steps', type=int, default=50,
+        help='Total inference steps (default: 50)'
+    )
+    parser.add_argument(
+        '--cache_step_interval', type=int, default=4,
+        help='Step interval to skip when using cache (default: 4)'
+    )
 
     args = parser.parse_args()
     

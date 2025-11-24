@@ -39,6 +39,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import BaseOutput, deprecate, logging
 
+from hyvideo.commons.cache_helper import CacheHelper
 from hyvideo.commons import (
     PIPELINE_CONFIGS,
     SR_PIPELINE_CONFIGS,
@@ -71,6 +72,7 @@ from hyvideo.utils.data_utils import (
 from hyvideo.utils.multitask_utils import (
     merge_tensor_by_mask,
 )
+from hyvideo.commons.infer_state import get_infer_state
 
 from .pipeline_utils import retrieve_timesteps, rescale_noise_cfg
 
@@ -1180,8 +1182,15 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        cache_helper = getattr(self, 'cache_helper', None)
+        if cache_helper is not None:
+            cache_helper.clear_cache()
+            assert num_inference_steps == get_infer_state().total_steps
+
         with self.progress_bar(total=num_inference_steps) as progress_bar, auto_offload_model(self.transformer, self.execution_device, enabled=self.enable_offloading):
             for i, t in enumerate(timesteps):
+                if cache_helper is not None:
+                    cache_helper.cur_timestep = i
                 latents_concat = torch.concat([latents, cond_latents], dim=1)
                 latent_model_input = torch.cat([latents_concat] * 2) if self.do_classifier_free_guidance else latents_concat
 
@@ -1411,6 +1420,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             os.path.join(cached_folder, "transformer", transformer_version), torch_dtype=transformer_dtype, 
             low_cpu_mem_usage=True,
         ).to(transformer_init_device)
+
         vae = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(
             os.path.join(cached_folder, "vae"), 
             torch_dtype=vae_inference_config['dtype']
@@ -1438,6 +1448,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         }
 
 
+
         if overlap_group_offloading is None:
             available_cpu_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
             # use_stream requires higher cpu memory
@@ -1450,6 +1461,18 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
 
         loguru.logger.info(f"{enable_offloading=} {enable_group_offloading=} {overlap_group_offloading=}")
+
+        infer_state = get_infer_state()
+        if infer_state.enable_cache:
+            no_cache_steps = list(range(0, infer_state.cache_start_step)) + list(range(infer_state.cache_start_step, infer_state.cache_end_step, infer_state.cache_step_interval)) + list(range(infer_state.cache_end_step, infer_state.total_steps))
+            cache_helper = CacheHelper(
+                pipe_model=transformer,
+                no_cache_steps=no_cache_steps, 
+                no_cache_block_id={"double":[53]} # Added single block to skip caching
+            )
+            cache_helper.enable()
+        else:
+            cache_helper = None
 
         if enable_group_offloading:
             assert enable_offloading
@@ -1471,6 +1494,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             enable_offloading=enable_offloading,
             **PIPELINE_CONFIGS[transformer_version],
         )
+        if cache_helper is not None:
+            pipeline.cache_helper = cache_helper
 
         if create_sr_pipeline:
             sr_version = TRANSFORMER_VERSION_TO_SR_VERSION[transformer_version]
@@ -1478,6 +1503,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             pipeline.sr_pipeline = sr_pipeline
             if enable_group_offloading:
                 sr_pipeline.transformer.enable_group_offload(**group_offloading_kwargs)
+
 
         return pipeline
 

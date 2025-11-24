@@ -216,6 +216,7 @@ SPARSE_ATTN=false # Inference with sparse attention (only 720p models are equipp
 SAGE_ATTN=true # Inference with SageAttention
 REWRITE=true # Enable prompt rewriting. Please ensure rewrite vLLM server is deployed and configured.
 OVERLAP_GROUP_OFFLOADING=true # Only valid when group offloading is enabled, significantly increases CPU memory usage but speeds up inference
+ENABLE_CACHE=true # Enable feature cache during inference. Significantly speeds up inference.
 MODEL_PATH=ckpts # Path to pretrained model
 
 torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
@@ -227,6 +228,7 @@ torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
   --cfg_distilled $CFG_DISTILLED \
   --sparse_attn $SPARSE_ATTN \
   --use_sageattn $SAGE_ATTN \
+  --enable_cache $ENABLE_CACHE \
   --rewrite $REWRITE \
   --output_path $OUTPUT_PATH \
   --overlap_group_offloading $OVERLAP_GROUP_OFFLOADING \
@@ -271,6 +273,11 @@ torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
 | `--use_sageattn` | bool | No | `false` | Enable SageAttention (use `--use_sageattn` or `--use_sageattn true/1` to enable, `--use_sageattn false/0` to disable) |
 | `--sage_blocks_range` | str | No | `0-53` | SageAttention blocks range (e.g., `0-5` or `0,1,2,3,4,5`) |
 | `--enable_torch_compile` | bool | No | `false` | Enable torch compile for transformer (use `--enable_torch_compile` or `--enable_torch_compile true/1` to enable, `--enable_torch_compile false/0` to disable) |
+| `--enable_cache` | bool | No | `false` | Enable cache for transformer (use `--enable_cache` or `--enable_cache true/1` to enable, `--enable_cache false/0` to disable) |
+| `--cache_start_step` | int | No | `11` | Start step to skip when using cache |
+| `--cache_end_step` | int | No | `45` | End step to skip when using cache |
+| `--total_steps` | int | No | `50` | Total inference steps |
+| `--cache_step_interval` | int | No | `4` | Step interval to skip when using cache |
 
 **Note:** Use `--nproc_per_node` to specify the number of GPUs. For example, `--nproc_per_node=8` uses 8 GPUs.
 
