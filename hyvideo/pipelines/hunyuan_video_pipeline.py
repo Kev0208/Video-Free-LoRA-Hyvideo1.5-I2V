@@ -899,6 +899,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         output_type: Optional[str] = "pt",
         return_dict: bool = True,
         return_pre_sr_video: bool = False,
+        enable_vae_tile_parallelism: bool = True,
         **kwargs,
     ):
         r"""
@@ -1266,6 +1267,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
                 lq_latents=latents,
                 reference_image=user_reference_image,
+                enable_vae_tile_parallelism=enable_vae_tile_parallelism,
             )
 
         if output_type == "latent":
@@ -1283,7 +1285,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             else:
                 latents = latents / self.vae.config.scaling_factor
 
-            if hasattr(self.vae, 'enable_tile_parallelism'):
+            if enable_vae_tile_parallelism and hasattr(self.vae, 'enable_tile_parallelism'):
                 self.vae.enable_tile_parallelism()
 
             if return_pre_sr_video or not enable_sr:
