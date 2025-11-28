@@ -167,7 +167,7 @@ def is_angelslim_available():
     except Exception:
         return False
 
-def maybe_fallback_attn_mode(attn_mode, infer_state=None, block_idx=None):
+def maybe_fallback_attn_mode(attn_mode):
     """
     Determine the final attention mode based on configuration and availability.
     

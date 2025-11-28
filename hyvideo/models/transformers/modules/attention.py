@@ -43,7 +43,6 @@ except Exception:
     logger.warning("Could not load Sliding Tile Attention of FlexAttn.")
 
 from hyvideo.models.transformers.modules.ssta_attention import ssta_3d_attention
-from hyvideo.commons.infer_state import get_infer_state
 
 
 
@@ -156,7 +155,7 @@ def sequence_parallel_attention(q, k, v,
     sequence_length = query.size(1)
     encoder_sequence_length = encoder_query.size(1)
 
-    attn_mode = maybe_fallback_attn_mode(attn_mode, get_infer_state(), block_idx)
+    attn_mode = maybe_fallback_attn_mode(attn_mode)
     
     if attn_mode == "sageattn":
         from sageattention import sageattn
