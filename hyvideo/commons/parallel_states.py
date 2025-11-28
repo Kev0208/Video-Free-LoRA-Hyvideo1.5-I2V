@@ -41,6 +41,7 @@ class ParallelDims:
             mesh_dim_names=["dp", "sp"]
         )
         self.world_mesh = mesh
+        self.fsdp_mesh = mesh['dp', 'sp']
         return mesh
 
     @property

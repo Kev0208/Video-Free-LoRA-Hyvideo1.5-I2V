@@ -42,7 +42,7 @@ HunyuanVideo-1.5 is a video generation model that delivers top-tier quality with
 
 ## 🔥🔥🔥 News
 * 🚀 Dec 05, 2025: **New Release**: We now release the [480p I2V step-distilled model](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/main/transformer/480p_i2v_step_distilled), which generates videos in 8 or 12 steps (recommended)! On RTX 4090, end-to-end generation time is reduced by 75%, and a single RTX 4090 can generate videos within 75 seconds. The step-distilled model maintains comparable quality to the original model while achieving significant speedup. See [Step Distillation Comparison](./assets/step_distillation_comparison.md) for detailed quality comparisons. For even faster generation, you can also try 4 steps (faster speed with slightly reduced quality). **To enable the step-distilled model, run `generate.py` with the `--enable_step_distill` parameter.** See [Usage](#-usage) for detailed usage instructions. 🔥🔥🔥🆕
-* 📚 Training code is coming soon. HunyuanVideo-1.5 is trained using the Muon optimizer, which we have open-sourced in the in [Training](#-training) section. **If you would like to continue training our model or fine-tune it with LoRA, please use the Muon optimizer.**
+* 📚 Dec 05, 2025: **Training Code Released**: We now open-source the training code for HunyuanVideo-1.5! The training script (`train.py`) provides a full training pipeline with support for distributed training, FSDP, context parallel, gradient checkpointing, and more. HunyuanVideo-1.5 is trained using the Muon optimizer, which we have open-sourced in the [Training](#-training) section. **If you would like to continue training our model or fine-tune it with LoRA, please use the Muon optimizer.** See [Training](#-training) section for detailed usage instructions. 🔥🔥🔥🆕
 * 🎉 **Diffusers Support**: HunyuanVideo-1.5 is now available on Hugging Face Diffusers! Check out [Diffusers collection](https://huggingface.co/collections/hunyuanvideo-community/hunyuanvideo-15) for easy integration. 🔥🔥🔥🆕
 * 🚀 Nov 27, 2025: We now support cache inference (deepcache, teacache, taylorcache), achieving significant speedup! Pull the latest code to try it. 🔥🔥🔥🆕 
 * 🚀 Nov 24, 2025: We now support deepcache inference.
@@ -421,29 +421,85 @@ For more details, please visit [HunyuanVideo-1.5 Diffusers Collection](https://h
 
 ## 🎓 Training
 
-> 💡 Training code is coming soon. We will release the complete training pipeline in the future.
-
 HunyuanVideo-1.5 is trained using the **Muon optimizer**, which accelerates convergence and improves training stability. The Muon optimizer combines momentum-based updates with Newton-Schulz orthogonalization for efficient optimization of large-scale video generation models.
 
-### Creating a Muon Optimizer
+### Quick Start
 
-Here's how to create a Muon optimizer for your model:
+The training script (`train.py`) provides a complete training pipeline for HunyuanVideo-1.5. Here's how to use it:
 
-```python
-from hyvideo.optim.muon import get_muon_optimizer
+#### 1. Implement Your DataLoader
 
-# Create Muon optimizer for your model
-optimizer = get_muon_optimizer(
-    model=your_model,
-    lr=lr,                      # Learning rate
-    weight_decay=weight_decay,  # Weight decay
-    momentum=momentum,          # Momentum coefficient
-    adamw_betas=adamw_betas,   # AdamW betas for 1D parameters
-    adamw_eps=adamw_eps        # AdamW epsilon
-)
+Replace the `create_dummy_dataloader()` function in `train.py` with your own implementation. Your dataloader should return batches with the following format:
+
+- **Required fields:**
+  - `"pixel_values"`: `torch.Tensor` - Video: `[B, C, F, H, W]` or Image: `[B, C, H, W]`
+    - Note: For video data, temporal dimension F must be `4n+1` (e.g., 1, 5, 9, 13, 17, ...)
+  - `"text"`: `List[str]` - Text prompts for each sample
+  - `"data_type"`: `str` - `"video"` or `"image"`
+
+- **Optional fields (for performance optimization):**
+  - `"latents"`: Pre-encoded VAE latents (skips VAE encoding for faster training)
+  - `"byt5_text_ids"` and `"byt5_text_mask"`: Pre-tokenized byT5 inputs
+
+See the `create_dummy_dataloader()` function in `train.py` for detailed batch format documentation.
+
+#### 2. Run Training
+
+**Single GPU:**
+```bash
+python train.py --pretrained_model_root <path_to_pretrained_model> [other args]
 ```
 
-> 📝 **To be continued**: More training details and the complete training pipeline will be released soon. Stay tuned!
+**Multi-GPU:**
+```bash
+N=8
+torchrun --nproc_per_node=$N train.py --pretrained_model_root <path_to_pretrained_model> [other args]
+```
+
+**Example:**
+```bash
+torchrun --nproc_per_node=8 train.py \
+  --pretrained_model_root ./ckpts \
+  --learning_rate 1e-5 \
+  --batch_size 1 \
+  --max_steps 10000 \
+  --output_dir ./outputs \
+  --enable_fsdp \
+  --enable_gradient_checkpointing \
+  --sp_size 8
+```
+
+#### 3. Key Training Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--pretrained_model_root` | Path to pretrained model (required) | - |
+| `--learning_rate` | Learning rate | 1e-5 |
+| `--batch_size` | Batch size | 1 |
+| `--max_steps` | Maximum training steps | 10000 |
+| `--warmup_steps` | Warmup steps | 500 |
+| `--gradient_accumulation_steps` | Gradient accumulation steps | 1 |
+| `--enable_fsdp` | Enable FSDP for distributed training | true |
+| `--enable_gradient_checkpointing` | Enable gradient checkpointing | true |
+| `--sp_size` | Sequence parallelism size (must divide world_size) | 8 |
+| `--i2v_prob` | Probability of i2v task for video data | 0.3 |
+| `--use_muon` | Use Muon optimizer | true |
+| `--resume_from_checkpoint` | Resume from checkpoint directory | None |
+
+#### 4. Monitor Training
+
+- Checkpoints are saved to `output_dir` at intervals specified by `--save_interval`
+- Validation videos are generated at intervals specified by `--validation_interval`
+- Training logs are printed to console at intervals specified by `--log_interval`
+
+#### 5. Resume Training
+
+Use `--resume_from_checkpoint <checkpoint_dir>` to resume from a saved checkpoint:
+```bash
+python train.py \
+  --pretrained_model_root <path> \
+  --resume_from_checkpoint ./outputs/checkpoint-1000
+```
 
 ## 🎬 More Examples
 |Features|Demo1|Demo2|
