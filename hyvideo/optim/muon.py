@@ -1,14 +1,5 @@
-# PTM Muon Optimizer
-# This code file implemented the refined version of MUON for ZERO 0 and FSDP
-# Author: Weiyan Wang
-# Email: neowywang@tencent.com
-# Example: optim = get_muon_optimizer(model, lr=1e-3,  weight_decay=0.1, momentum=0.95, adamw_betas=(0.95, 0.95), adamw_eps=1e-8)
-
-
-import os
 import math
 import torch
-import torch.distributed
 try:
     from torch.distributed.tensor import DTensor
     from torch.distributed.tensor.placement_types import (
@@ -41,7 +32,6 @@ def zeropower_via_newtonschulz5(G, steps = 5):
         
     assert len(G.shape) >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    #X = G.bfloat16()
     X = G
     if G.size(-2) > G.size(-1):
         X = X.mT
@@ -216,20 +206,18 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 
-
+# help function to create the Muon optimizer
 def get_muon_optimizer(model, lr=1e-3,  weight_decay=0.1, momentum=0.95, adamw_betas=(0.95, 0.95), adamw_eps=1e-8):
     muon_params = [
         p
         for name, p in model.named_parameters()
         if p.ndim >= 2 
-        #if p.ndim == 2 and "embed_tokens" not in name and "final_layer" not in name
     ]
     adamw_params = [
         p
         for name, p in model.named_parameters()
         if not (
-            p.ndim >= 2
-            #p.ndim == 2 and "embed_tokens" not in name and "final_layer" not in name
+            p.ndim >= 2 
         )
     ]
 
@@ -242,51 +230,3 @@ def get_muon_optimizer(model, lr=1e-3,  weight_decay=0.1, momentum=0.95, adamw_b
         adamw_betas=adamw_betas,
         adamw_eps=adamw_eps,
     )
-    
-# unit test
-if __name__ == '__main__':
-    import time
-    torch.manual_seed(0)
-    z = 640
-    m = 2048
-    n = 2048
-    k = 2048
-    trans_b = True
-    profile_time = 50
-    
-    our_t = 0
-    base_t = 0
-    
-    streams=[]
-    for i in range(8):
-        streams.append(torch.cuda.Stream())
-
-    a = torch.randn( m, n).cuda()
-
-    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-
-
-#    torch.cuda.synchronize()
-#    t = time.time()
-    starter.record()
-    for t in range(profile_time):
-        for i in range(z):
-            with torch.cuda.stream(streams[i%len(streams)]):
-                zeropower_via_newtonschulz5(a)
-    ender.record()
-    torch.cuda.synchronize()
-    our_t = starter.elapsed_time(ender) 
-    print("multiple streams finished!")
-
-    #torch.cuda.synchronize()
-    #t = time.time()
-    starter.record()
-    for t in range(profile_time):
-        for i in range(z):
-            zeropower_via_newtonschulz5(a)
-    ender.record()
-    torch.cuda.synchronize()
-    base_t = starter.elapsed_time(ender) 
-    #print("baseline finished!")
-
-    print("gmm_t:", our_t, "mm_t:", base_t, "speedup", base_t/our_t)
