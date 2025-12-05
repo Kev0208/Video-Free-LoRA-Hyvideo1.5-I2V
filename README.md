@@ -235,24 +235,28 @@ export I2V_REWRITE_MODEL_NAME="<your_model_name>"
 
 PROMPT='A girl holding a paper with words "Hello, world!"'
 
-IMAGE_PATH=none # Optional, none or <image path> to enable i2v mode
+IMAGE_PATH=/path/to/image.png # Optional, none or <image path> to enable i2v mode
 SEED=1
 ASPECT_RATIO=16:9
 RESOLUTION=480p
 OUTPUT_PATH=./outputs/output.mp4
+MODEL_PATH=./ckpts # Path to pretrained model
 
-# Configuration
-REWRITE=true # Enable prompt rewriting. Please ensure rewrite vLLM server is deployed and configured.
+# Configuration for faster inference
 N_INFERENCE_GPU=8 # Parallel inference GPU count
 CFG_DISTILLED=true # Inference with CFG distilled model, 2x speedup
-ENABLE_STEP_DISTILL=true # Enable step distilled model for 480p I2V, recommended 8 or 12 steps, 75% speedup on RTX 4090
-SPARSE_ATTN=false # Inference with sparse attention (only 720p models are equipped with sparse attention). Please ensure flex-block-attn is installed
 SAGE_ATTN=true # Inference with SageAttention
+SPARSE_ATTN=false # Inference with sparse attention (only 720p models are equipped with sparse attention). Please ensure flex-block-attn is installed
 OVERLAP_GROUP_OFFLOADING=true # Only valid when group offloading is enabled, significantly increases CPU memory usage but speeds up inference
 ENABLE_CACHE=true # Enable feature cache during inference. Significantly speeds up inference.
 CACHE_TYPE=deepcache # Support: deepcache, teacache, taylorcache
+ENABLE_STEP_DISTILL=true # Enable step distilled model for 480p I2V, recommended 8 or 12 steps, up to 6x speedup
+
+
+# Configuration for better quality
+REWRITE=true # Enable prompt rewriting. Please ensure rewrite vLLM server is deployed and configured.
 ENABLE_SR=true # Enable super resolution
-MODEL_PATH=ckpts # Path to pretrained model
+
 
 torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py \
   --prompt "$PROMPT" \
