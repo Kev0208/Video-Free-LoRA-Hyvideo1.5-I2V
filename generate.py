@@ -29,6 +29,8 @@ import argparse
 import einops
 import imageio
 from torch import distributed as dist
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
 from hyvideo.pipelines.hunyuan_video_pipeline import HunyuanVideo_1_5_Pipeline
 from hyvideo.commons.parallel_states import initialize_parallel_state
@@ -90,6 +92,28 @@ def str_to_bool(value):
         elif value in ('false', '0', 'no', 'off'):
             return False
     raise argparse.ArgumentTypeError(f"Boolean value expected, got: {value}")
+
+def load_checkpoint_to_transformer(pipe, checkpoint_path):
+    
+    if not os.path.exists(checkpoint_path):
+        raise ValueError(f"Checkpoint path does not exist: {checkpoint_path}")
+    
+    if not os.path.exists(checkpoint_path):
+        raise ValueError(f"Transformer checkpoint directory not found: {checkpoint_path}")
+    
+    rank0_log(f"Loading checkpoint from {checkpoint_path}", "INFO")
+    
+    try:
+        model_state_dict = get_model_state_dict(pipe.transformer)
+        dcp.load(
+            state_dict={"model": model_state_dict},
+            checkpoint_id=checkpoint_path,
+        )
+        rank0_log("Transformer model state loaded successfully", "INFO")
+    except Exception as e:
+        rank0_log(f"Error loading checkpoint: {e}", "ERROR")
+        raise
+    
 
 def generate_video(args):
 
@@ -157,6 +181,9 @@ def generate_video(args):
         overlap_group_offloading=overlap_group_offloading,
     )
     
+    # Load checkpoint if provided
+    if args.checkpoint_path:
+        load_checkpoint_to_transformer(pipe, args.checkpoint_path)
 
     # Apply optimizations to SR pipeline if exists
     if enable_sr and hasattr(pipe, 'sr_pipeline'):
@@ -378,6 +405,12 @@ def main():
              'Use --save_generation_config or --save_generation_config true/1 to enable, '
              '--save_generation_config false/0 to disable'
     )
+    parser.add_argument(
+        '--checkpoint_path', type=str, default=None,
+        help='Path to checkpoint directory containing transformer weights (e.g., ./outputs/checkpoint-1000/transformer). '
+             'The checkpoint directory should contain a "transformer" subdirectory. '
+             'If provided, the transformer model weights will be loaded from this checkpoint.'
+    )
 
     args = parser.parse_args()
     
@@ -387,7 +420,8 @@ def main():
     
     
     generate_video(args)
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
