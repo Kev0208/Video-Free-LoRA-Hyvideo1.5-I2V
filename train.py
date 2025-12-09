@@ -283,6 +283,10 @@ def sync_tensor_for_sp(tensor: torch.Tensor, sp_group) -> torch.Tensor:
     """
     if sp_group is None:
         return tensor
+    if not isinstance(tensor, torch.Tensor):
+        obj_list = [tensor]
+        dist.broadcast_object_list(obj_list, src=0, group=sp_group)
+        return obj_list[0]
     dist.broadcast(tensor, src=0, group=sp_group)
     return tensor
 
@@ -643,6 +647,11 @@ class HunyuanVideoTrainer:
 
             latents = self.encode_vae(images)
         
+        if self.sp_enabled:
+            latents = sync_tensor_for_sp(latents, self.sp_group)
+            if images is not None:
+                images = sync_tensor_for_sp(images, self.sp_group)
+        
         data_type_raw = batch.get("data_type", "image")
         if isinstance(data_type_raw, list):
             data_type = data_type_raw[0]
@@ -651,9 +660,14 @@ class HunyuanVideoTrainer:
         else:
             data_type = str(data_type_raw) if data_type_raw is not None else "image"
         task_type = self.sample_task(data_type)
+
+        if self.sp_enabled:
+            task_type = sync_tensor_for_sp(task_type, self.sp_group)
         
         cond_latents = self.get_condition(latents, task_type)
         prompts = batch["text"]
+        if self.sp_enabled:
+            prompts = sync_tensor_for_sp(prompts, self.sp_group)
         text_emb, text_mask, text_emb_2, text_mask_2 = self.encode_text(prompts, data_type=data_type)
         
         byt5_text_states = None
@@ -662,6 +676,9 @@ class HunyuanVideoTrainer:
             if "byt5_text_ids" in batch and batch["byt5_text_ids"] is not None:
                 byt5_text_ids = batch["byt5_text_ids"].to(self.device)
                 byt5_text_mask = batch["byt5_text_mask"].to(self.device)
+                if self.sp_enabled:
+                    byt5_text_ids = sync_tensor_for_sp(byt5_text_ids, self.sp_group)
+                    byt5_text_mask = sync_tensor_for_sp(byt5_text_mask, self.sp_group)
                 byt5_text_states, byt5_text_mask = self.encode_byt5(byt5_text_ids, byt5_text_mask)
             else:
                 byt5_embeddings_list = []
@@ -686,13 +703,6 @@ class HunyuanVideoTrainer:
         noise = torch.randn_like(latents)
         timesteps = self.timestep_sampler.sample(latents.shape[0], device=self.device)
         timesteps = timestep_transform(timesteps, self.config.num_train_timesteps, self.config.train_timestep_shift)
-        
-        # Sync key tensors within SP group to ensure consistency for loss calculation
-        if self.sp_enabled:
-            timesteps = sync_tensor_for_sp(timesteps, self.sp_group)
-            latents = sync_tensor_for_sp(latents, self.sp_group)
-            noise = sync_tensor_for_sp(noise, self.sp_group)
-            cond_latents = sync_tensor_for_sp(cond_latents, self.sp_group)
         
         latents_noised = self.noise_schedule.forward(latents, noise, timesteps)
         target = noise - latents
