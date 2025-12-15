@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from loguru import logger
+from functools import cache
 
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -610,6 +611,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         for block in self.single_blocks:
             block.disable_deterministic()
 
+    @cache
     def get_rotary_pos_embed(self, rope_sizes):
         target_ndim = 3
         head_dim = self.hidden_size // self.heads_num
