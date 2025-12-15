@@ -113,6 +113,21 @@ def load_checkpoint_to_transformer(pipe, checkpoint_path):
     except Exception as e:
         rank0_log(f"Error loading checkpoint: {e}", "ERROR")
         raise
+
+def load_lora_adapter(pipe, lora_path):
+    rank0_log(f"Loading LoRA adapter from {lora_path}", "INFO")
+    try:
+        pipe.transformer.load_lora_adapter(
+            pretrained_model_name_or_path_or_dict=lora_path,
+            prefix=None,
+            adapter_name="default",
+            use_safetensors=True,
+            hotswap=False,
+        )
+        rank0_log("LoRA adapter loaded successfully", "INFO")
+    except Exception as e:
+        rank0_log(f"Error loading LoRA adapter: {e}", "ERROR")
+        raise
     
 
 def generate_video(args):
@@ -184,6 +199,9 @@ def generate_video(args):
     # Load checkpoint if provided
     if args.checkpoint_path:
         load_checkpoint_to_transformer(pipe, args.checkpoint_path)
+    
+    if args.lora_path:
+        load_lora_adapter(pipe, args.lora_path)
 
     # Apply optimizations to SR pipeline if exists
     if enable_sr and hasattr(pipe, 'sr_pipeline'):
@@ -410,6 +428,11 @@ def main():
         help='Path to checkpoint directory containing transformer weights (e.g., ./outputs/checkpoint-1000/transformer). '
              'The checkpoint directory should contain a "transformer" subdirectory. '
              'If provided, the transformer model weights will be loaded from this checkpoint.'
+    )
+    parser.add_argument(
+        '--lora_path', type=str, default=None,
+        help='Path to LoRA adapter directory or checkpoint directory containing LoRA adapter. '
+             'If provided, the LoRA adapter will be loaded to the transformer model.'
     )
 
     args = parser.parse_args()
