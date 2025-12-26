@@ -649,12 +649,13 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         negative_embeddings = []
         negative_masks = []
 
+        do_cfg = getattr(self, "do_classifier_free_guidance", False)
         for prompt in prompt_list:
             pos_emb, pos_mask = self._process_single_byt5_prompt(prompt, device)
             positive_embeddings.append(pos_emb)
             positive_masks.append(pos_mask)
 
-            if self.do_classifier_free_guidance:
+            if do_cfg:
                 neg_emb, neg_mask = self._process_single_byt5_prompt("", device)
                 negative_embeddings.append(neg_emb)
                 negative_masks.append(neg_mask)
@@ -662,7 +663,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         byt5_positive = torch.cat(positive_embeddings, dim=0)
         byt5_positive_mask = torch.cat(positive_masks, dim=0)
         
-        if self.do_classifier_free_guidance:
+        if do_cfg:
             byt5_negative = torch.cat(negative_embeddings, dim=0)
             byt5_negative_mask = torch.cat(negative_masks, dim=0)
             
@@ -850,7 +851,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
                 cond_latents = self.vae.encode(ref_images_pixel_values).latent_dist.mode()
-                cond_latents.mul_(self.vae.config.scaling_factor)
+                cond_latents = cond_latents * self.vae.config.scaling_factor
             
         else:
             raise ValueError(f"Unsupported task_type: {task_type}. Must be 't2v' or 'i2v'")
@@ -1411,7 +1412,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
     def load_sr_transformer_upsampler(cls, cached_folder, sr_version, transformer_dtype=torch.bfloat16, device=None):
         transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
             os.path.join(cached_folder, "transformer", sr_version), 
-            low_cpu_mem_usage=True, 
+            low_cpu_mem_usage=False, 
             torch_dtype=transformer_dtype
         ).to(device)
         upsampler_cls = SRTo720pUpsampler if "720p" in sr_version else SRTo1080pUpsampler
@@ -1502,7 +1503,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
             **from_pretrain_kwargs,
             torch_dtype=transformer_dtype, 
-            low_cpu_mem_usage=True,
+            low_cpu_mem_usage=False,
         ).to(transformer_init_device)
 
         vae = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(

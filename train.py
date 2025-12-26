@@ -15,85 +15,108 @@
 # See the License for the specific language governing permissions and limitations under the License.
 
 """
-HunyuanVideo-1.5 Training Script
+HunyuanVideo-1.5 training script for image-to-video distillation with identity guidance.
 
-This script provides a complete training pipeline for HunyuanVideo-1.5 model.
+This script trains a student transformer using a frozen teacher via short rollouts.
+Key steps:
+- Sample timesteps along the teacher trajectory using bracketed buckets with jitter.
+- Harvest teacher predictions at those timesteps for a distillation MSE loss.
+- Choose a deep timestep for identity guidance, estimate x0, decode with the 3D VAE,
+  sample frames, and compute an identity loss with a frozen DINO encoder.
 
-Quick Start:
-1. Implement your own dataloader:
-   - Replace the `create_dummy_dataloader()` function with your own implementation
-   - Your dataloader should return batches with the following format:
-     * "pixel_values": torch.Tensor - Video: [B, C, F, H, W] or Image: [B, C, H, W]
-       Pixel values must be in range [-1, 1] 
-       Note: For video data, temporal dimension F must be 4n+1 (e.g., 1, 5, 9, 13, 17, ...)
-     * "text": List[str] - Text prompts for each sample
-     * "data_type": str - "video" or "image"
-     * Optional: "latents" - Pre-encoded VAE latents for faster training
-     * Optional: "byt5_text_ids" and "byt5_text_mask" - Pre-tokenized byT5 inputs
-   - See `create_dummy_dataloader()` function for detailed batch format documentation
+WebDataset layout:
+  <wds_root>/
+    data/{train,val}/{split}-*.tar
+    manifest/{split}_manifest.csv
 
-2. Configure training parameters:
-   - Set `--pretrained_model_root` to your pretrained model path
-   - Adjust training hyperparameters (learning_rate, batch_size, etc.)
-   - Configure distributed training settings (sp_size, enable_fsdp, etc.)
+Each shard sample must include:
+  - <id>.<ext> (jpg/jpeg/png/webp) image bytes
+  - <id>.json metadata
 
-3. Run training:
-   - Single GPU: python train.py --pretrained_model_root <path> [other args]
-   - Multi-GPU: torchrun --nproc_per_node=N train.py --pretrained_model_root <path> [other args]
+The metadata JSON must include a character identifier field, provided via --metadata_key.
+Character strings are converted into prompts via build_prompt.build_prompt.
+The manifest CSV must contain the same column name and a "count" column:
+  <metadata_key>,count
+These counts are used for inverse-frequency accept/reject sampling to reduce
+character imbalance.
 
-4. Monitor training:
-   - Checkpoints are saved to `output_dir` at intervals specified by `--save_interval`
-   - Validation videos are generated at intervals specified by `--validation_interval`
-   - Training logs are printed to console at intervals specified by `--log_interval`
+Checkpoints:
+- Multi-rank FSDP saves sharded weights using torch.distributed.checkpoint (DCP) under
+  <output_dir>/checkpoint-<step>/dcp.
+- Single-rank runs save the LoRA adapter (if enabled) and optimizer/scheduler state.
 
-5. Resume training:
-   - Use `--resume_from_checkpoint <checkpoint_dir>` to resume from a saved checkpoint
+Example usage:
+  torchrun --nproc_per_node=4 train.py \
+    --pipeline_dir /your/path/to/hunyuanvideo_pipeline \
+    --wds_root /your/path/to/wds_root \
+    --metadata_key character_id \
+    --dino_model_dir /your/path/to/dino_model \
+    --dino_head_path /your/path/to/dino_head.pt \
+    --output_dir ./outputs
 
-For detailed batch format requirements, see the docstring of `create_dummy_dataloader()` function.
+Resume training:
+  torchrun --nproc_per_node=4 train.py \
+    --pipeline_dir /your/path/to/hunyuanvideo_pipeline \
+    --wds_root /your/path/to/wds_root \
+    --metadata_key character_id \
+    --dino_model_dir /your/path/to/dino_model \
+    --dino_head_path /your/path/to/dino_head.pt \
+    --output_dir ./outputs \
+    --resume_from_checkpoint /your/path/to/outputs/checkpoint-2500
 """
 
+import argparse
+import csv
+import io
+import json
+import math
 import os
 import random
-import math
-import argparse
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
-from enum import Enum
+from glob import glob
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import einops
+import imageio
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    get_optimizer_state_dict,
-)
-from diffusers.optimization import get_scheduler
+import torch.nn.functional as F
 from loguru import logger
-import einops
-import imageio
+from PIL import Image, ImageOps
+from transformers import AutoImageProcessor, AutoModel
 
-from hyvideo.pipelines.hunyuan_video_pipeline import HunyuanVideo_1_5_Pipeline
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
+from diffusers.optimization import get_scheduler
 from hyvideo.commons.parallel_states import get_parallel_state, initialize_parallel_state
 from hyvideo.optim.muon import get_muon_optimizer
+from hyvideo.pipelines.hunyuan_video_pipeline import HunyuanVideo_1_5_Pipeline
+from hyvideo.schedulers.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from hyvideo.models.transformers.hunyuanvideo_1_5_transformer import HunyuanVideo_1_5_DiffusionTransformer
 
-from torch.distributed._composable.fsdp import (
-    MixedPrecisionPolicy,
-    fully_shard,
-)
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
     checkpoint_wrapper,
 )
 
+import build_prompt
 
-class SNRType(str, Enum):
-    UNIFORM = "uniform"
-    LOGNORM = "lognorm"
-    MIX = "mix"
-    MODE = "mode"
-
+# --- WebDataset required (no manual tarfile I/O) ---
+try:
+    import webdataset as wds
+except Exception as e:
+    raise RuntimeError(
+        "webdataset is required for this training script. "
+        "Please `pip install webdataset` in your environment."
+    ) from e
 
 def str_to_bool(value):
     """Convert string to boolean, supporting true/false, 1/0, yes/no.
@@ -104,9 +127,9 @@ def str_to_bool(value):
         return value
     if isinstance(value, str):
         value = value.lower().strip()
-        if value in ('true', '1', 'yes', 'on'):
+        if value in ("true", "1", "yes", "on"):
             return True
-        elif value in ('false', '0', 'no', 'off'):
+        elif value in ("false", "0", "no", "off"):
             return False
     raise argparse.ArgumentTypeError(f"Boolean value expected, got: {value}")
 
@@ -116,167 +139,472 @@ def save_video(video: torch.Tensor, path: str):
         assert video.shape[0] == 1, f"Expected batch size 1, got {video.shape[0]}"
         video = video[0]
     vid = (video * 255).clamp(0, 255).to(torch.uint8)
-    vid = einops.rearrange(vid, 'c f h w -> f h w c')
+    vid = einops.rearrange(vid, "c f h w -> f h w c")
     imageio.mimwrite(path, vid.cpu().numpy(), fps=24)
+
+
+def crop_long_side_only(
+    img: Image.Image, r: float = 0.92, j: float = 0.04, rng: Optional[random.Random] = None
+) -> Image.Image:
+    """Lightweight augmentation: crop along long side with small jitter."""
+    if rng is None:
+        rng = random
+    img = ImageOps.exif_transpose(img)
+    W, H = img.size
+
+    if W >= H:
+        Cw = int(round(W * r))
+        Cw = max(1, min(Cw, W))
+
+        dx = rng.uniform(-j * Cw, j * Cw)
+        cx = (W / 2.0) + dx
+        x0 = int(round(cx - Cw / 2.0))
+        x0 = max(0, min(x0, W - Cw))
+
+        return img.crop((x0, 0, x0 + Cw, H))
+    else:
+        Ch = int(round(H * r))
+        Ch = max(1, min(Ch, H))
+
+        dy = rng.uniform(-j * Ch, j * Ch)
+        cy = (H / 2.0) + dy
+        y0 = int(round(cy - Ch / 2.0))
+        y0 = max(0, min(y0, H - Ch))
+
+        return img.crop((0, y0, W, y0 + Ch))
+
+
+DEFAULT_LORA_TARGETS = [
+    # MMDoubleStreamBlock
+    "img_attn_q",
+    "img_attn_k",
+    "img_attn_v",
+    "img_attn_proj",
+    "txt_attn_q",
+    "txt_attn_k",
+    "txt_attn_v",
+    "txt_attn_proj",
+    # MMSingleStreamBlock
+    "linear1_q",
+    "linear1_k",
+    "linear1_v",
+    "linear2.fc",
+    "linear1_mlp",
+    # Modulation / gating
+    "img_mod.linear",
+    "txt_mod.linear",
+    "modulation.linear",
+    "adaLN_modulation.1",
+]
 
 
 @dataclass
 class TrainingConfig:
     # Model paths
-    pretrained_model_root: str
-    pretrained_transformer_version: str = "720p_t2v"
-    
-    # Training parameters
-    learning_rate: float = 5e-5
+    pipeline_dir: str
+    transformer_version: str = "480p_i2v"
+
+    # Data (WebDataset)
+    wds_root: str = ""
+    wds_shuffle_buf: int = 4096
+    batch_size: int = 1
+    num_workers: int = 4
+    p_secondary: float = 0.05
+    secondary_cache_max_size: int = 64
+    metadata_key: str = ""
+    enable_augmentation: bool = False
+    augment_r: float = 0.92
+    augment_j: float = 0.04
+    train_target_resolution: str = "480p"
+    train_video_length: int = 17  # must be 4n+1 for VAE
+
+    # Distillation / identity
+    num_inference_steps: int = 14
+    harvest_count: int = 2
+    harvest_scheme: str = "bracket"
+    harvest_jitter_frac: float = 0.05
+    id_timestep_frac_low: float = 0.7
+    id_timestep_frac_high: float = 0.9
+    id_num_frames: int = 3
+    lambda_id: float = 0.5
+    lambda_id_schedule: str = "constant"  # constant|linear|cosine
+    lambda_id_warmup_steps: int = 500
+    id_every_steps: int = 1
+    id_decode_downsample_mode: str = "false"  # false|area|bicubic
+    id_decode_scale: float = 1.0
+
+    # Optim
+    learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    max_steps: int = 10000
-    warmup_steps: int = 500
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     use_muon: bool = True
-    
-    # Diffusion parameters
-    num_train_timesteps: int = 1000
-    train_timestep_shift: float = 3.0
-    validation_timestep_shift: float = 5.0
-    snr_type: SNRType = SNRType.LOGNORM  # Timestep sampling strategy: uniform, lognorm, mix, or mode
-    
-    # Task configuration
-    task_type: str = "t2v"  # "t2v" or "i2v"
-    i2v_prob: float = 0.3  # Probability of using i2v task when data_type is video (default: 0.3 for video training)
-    
-    # FSDP configuration
-    enable_fsdp: bool = True  # Enable FSDP for distributed training
-    enable_gradient_checkpointing: bool = True  # Enable gradient checkpointing
-    sp_size: int = 8  # Sequence parallelism size (must divide world_size evenly)
-    
-    # Data configuration
-    batch_size: int = 1
-    num_workers: int = 4
-    
-    # Output configuration
-    output_dir: str = "./outputs"
-    save_interval: int = 1000
-    log_interval: int = 10
-    
-    # Device configuration
-    dtype: str = "bf16"  # "bf16" or "fp32"
-    
-    # Seed
-    seed: int = 42
-    
-    # Validation configuration
-    validation_interval: int = 100  # Run validation every N steps
-    validation_prompts: Optional[List[str]] = None  # Prompts for validation (default: single prompt)
-    validate_video_length: int = 121  # Video length (number of frames) for validation
-    
-    # Resume training configuration
-    resume_from_checkpoint: Optional[str] = None  # Path to checkpoint directory to resume from
-    
-    # LoRA configuration
-    use_lora: bool = False
+    max_train_steps: int = 10000
+    warmup_steps: int = 500
+
+    # LoRA
+    use_lora: bool = True
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.0
-    lora_target_modules: Optional[List[str]] = None  # Target modules for LoRA (default: all Linear layers)
+    lora_target_modules: Optional[List[str]] = None
     pretrained_lora_path: Optional[str] = None
 
+    # Identity model
+    dino_model_dir: str = ""
+    dino_head_path: str = ""
 
-class LinearInterpolationSchedule:
-    """Simple linear interpolation schedule for flow matching"""
-    def __init__(self, T: int = 1000):
-        self.T = T
-    
-    def forward(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Linear interpolation: x_t = (1 - t/T) * x0 + (t/T) * x1
-        Args:
-            x0: starting point (clean latents)
-            x1: ending point (noise)
-            t: timesteps
-        """
-        t_normalized = t / self.T
-        t_normalized = t_normalized.view(-1, *([1] * (x0.ndim - 1)))
-        return (1 - t_normalized) * x0 + t_normalized * x1
+    # Output / logging
+    output_dir: str = "./outputs"
+    save_every_steps: int = 1000
+    log_every_steps: int = 10
+    dtype: str = "bf16"  # bf16|fp32
+    seed: int = 42
+
+    # Validation
+    enable_validation: bool = False
+    val_every_steps: int = 1000
+    val_num_samples: int = 16
+    val_video_length: int = 121
+
+    # Distributed / misc
+    enable_fsdp: bool = True
+    enable_gradient_checkpointing: bool = True
+    sp_size: int = 8
+    resume_from_checkpoint: Optional[str] = None
 
 
-class TimestepSampler:
+class ProjectionHead(nn.Module):
+    """Projection head used for DINO identity embeddings."""
 
-    TRAIN_EPS = 1e-5
-    SAMPLE_EPS = 1e-3
-    
     def __init__(
-        self, 
-        T: int = 1000, 
-        device: torch.device = None,
-        snr_type: SNRType = SNRType.LOGNORM,
+        self,
+        in_dim: int,
+        hidden_dims: Sequence[int],
+        dropout: float = 0.05,
+        use_layernorm: bool = True,
     ):
-        self.T = T
-        self.device = device
-        self.snr_type = SNRType(snr_type) if isinstance(snr_type, str) else snr_type
-    
-    def _check_interval(self, eval: bool = False):
-        # For ICPlan-like path with velocity model, use [eps, 1-eps]
-        eps = self.SAMPLE_EPS if eval else self.TRAIN_EPS
-        t0 = eps
-        t1 = 1.0 - eps
-        return t0, t1
-    
-    def sample(self, batch_size: int, device: torch.device = None) -> torch.Tensor:
-        if device is None:
-            device = self.device if self.device is not None else torch.device("cuda")
-        
-        t0, t1 = self._check_interval(eval=False)
-        
-        if self.snr_type == SNRType.UNIFORM:
-            # Uniform sampling: t = rand() * (t1 - t0) + t0
-            t = torch.rand((batch_size,), device=device) * (t1 - t0) + t0
-            
-        elif self.snr_type == SNRType.LOGNORM:
-            # Log-normal sampling: t = 1 / (1 + exp(-u)) * (t1 - t0) + t0
-            u = torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device)
-            t = 1.0 / (1.0 + torch.exp(-u)) * (t1 - t0) + t0
-            
-        elif self.snr_type == SNRType.MIX:
-            # Mix sampling: 30% lognorm + 70% clipped uniform
-            u = torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device)
-            t_lognorm = 1.0 / (1.0 + torch.exp(-u)) * (t1 - t0) + t0
-            
-            # Clipped uniform: delta = 0.0 (0.0~0.01 clip)
-            delta = 0.0
-            t0_clip = t0 + delta
-            t1_clip = t1 - delta
-            t_clip_uniform = torch.rand((batch_size,), device=device) * (t1_clip - t0_clip) + t0_clip
-            
-            # Mix with 30% lognorm, 70% uniform
-            mask = (torch.rand((batch_size,), device=device) > 0.3).float()
-            t = mask * t_lognorm + (1 - mask) * t_clip_uniform
-            
-        elif self.snr_type == SNRType.MODE:
-            # Mode sampling: t = 1 - u - mode_scale * (cos(pi * u / 2)^2 - 1 + u)
-            mode_scale = 1.29
-            u = torch.rand(size=(batch_size,), device=device)
-            t = 1.0 - u - mode_scale * (torch.cos(math.pi * u / 2.0) ** 2 - 1.0 + u)
-            # Scale to [t0, t1] range
-            t = t * (t1 - t0) + t0
+        super().__init__()
+        layers: List[nn.Module] = []
+        prev = in_dim
+        for i, d in enumerate(hidden_dims):
+            layers.append(nn.Linear(prev, d))
+            is_last = i == len(hidden_dims) - 1
+            if not is_last:
+                if use_layernorm:
+                    layers.append(nn.LayerNorm(d))
+                layers.append(nn.GELU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+            prev = d
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def load_projection_head_state(path: str) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, Any]]]:
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "head_state_dict" in obj:
+        return obj["head_state_dict"], obj.get("config", None)
+    if isinstance(obj, dict) and all(isinstance(v, torch.Tensor) for v in obj.values()):
+        return obj, None
+    raise RuntimeError(f"Unexpected projection head checkpoint format at {path}")
+
+
+class DINOIdentity(nn.Module):
+    """Frozen DINOv3 backbone + projection head."""
+
+    def __init__(
+        self,
+        model_dir: str,
+        head_path: str,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__()
+        self.processor = AutoImageProcessor.from_pretrained(model_dir, local_files_only=True)
+        self.backbone = AutoModel.from_pretrained(
+            model_dir, local_files_only=True, torch_dtype=dtype
+        ).to(device)
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        size_cfg = self.processor.size
+        if isinstance(size_cfg, dict):
+            height = size_cfg.get("height") or size_cfg.get("shortest_edge") or 224
+            width = size_cfg.get("width") or size_cfg.get("shortest_edge") or height
+            self.target_size = (int(height), int(width))
         else:
-            raise ValueError(f"Unknown SNR type: {self.snr_type}")
-        
-        # Scale to [0, T] range
-        timesteps = t * self.T
-        return timesteps
+            self.target_size = (int(size_cfg), int(size_cfg))
+        self.image_mean = torch.tensor(self.processor.image_mean).view(1, 3, 1, 1).to(device)
+        self.image_std = torch.tensor(self.processor.image_std).view(1, 3, 1, 1).to(device)
+
+        head_sd, cfg = load_projection_head_state(head_path)
+        proj_dims = cfg.get("proj_dims", [512, 256]) if isinstance(cfg, dict) else [512, 256]
+        dropout = float(cfg.get("dropout", 0.05)) if isinstance(cfg, dict) else 0.05
+        use_layernorm = bool(cfg.get("use_layernorm", True)) if isinstance(cfg, dict) else True
+
+        self.head = ProjectionHead(
+            in_dim=self.backbone.config.hidden_size,
+            hidden_dims=proj_dims,
+            dropout=dropout,
+            use_layernorm=use_layernorm,
+        ).to(device=device, dtype=dtype)
+        self.head.load_state_dict(head_sd, strict=True)
+        self.head.eval()
+        for p in self.head.parameters():
+            p.requires_grad = False
+
+        self.device = device
+        self.dtype = dtype
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            images: float tensor in [0, 1], shape [B, 3, H, W]
+        Returns:
+            L2-normalized embeddings [B, D]
+        """
+        images = images.to(self.device)
+        if images.shape[-2:] != self.target_size:
+            images = F.interpolate(images, size=self.target_size, mode="bilinear", align_corners=False)
+        images = (images - self.image_mean) / self.image_std
+        with torch.cuda.amp.autocast(enabled=self.dtype == torch.bfloat16, dtype=self.dtype):
+            out = self.backbone(pixel_values=images.to(self.dtype))
+            pooled = out.pooler_output
+            if pooled is None:
+                pooled = out.last_hidden_state[:, 0]
+            proj = self.head(pooled.to(self.dtype))
+            proj = F.normalize(proj, dim=-1)
+        return proj
 
 
-def timestep_transform(timesteps: torch.Tensor, T: int, shift: float = 1.0) -> torch.Tensor:
-    """Transform timesteps with shift"""
-    if shift == 1.0:
-        return timesteps
-    timesteps_normalized = timesteps / T
-    timesteps_transformed = shift * timesteps_normalized / (1 + (shift - 1) * timesteps_normalized)
-    return timesteps_transformed * T
+# ------------------------- WebDataset pipeline helpers -------------------------
 
 
-def sync_tensor_for_sp(tensor: torch.Tensor, sp_group) -> torch.Tensor:
+def _load_manifest_counts(path: str, metadata_key: str) -> Tuple[Dict[str, int], int]:
+    """
+    Manifest schema:
+      <metadata_key>,count
+    """
+    counts: Dict[str, int] = {}
+    if not os.path.exists(path):
+        logger.warning(f"Manifest not found at {path}; inverse-frequency sampling will accept all samples.")
+        return counts, 1
+
+    with open(path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = row.get(metadata_key)
+            if key is None:
+                continue
+            k = str(key).strip().lower()
+            try:
+                c = int(row.get("count", 0))
+            except Exception:
+                c = 0
+            if c > 0:
+                counts[k] = c
+
+    min_count = min(counts.values()) if counts else 1
+    return counts, max(1, int(min_count))
+
+
+def _wds_worker_seed(base_seed: int) -> int:
+    wi = torch.utils.data.get_worker_info()
+    worker_id = wi.id if wi is not None else 0
+    rank = int(os.environ.get("RANK", "0"))
+    # Spread seeds across ranks/workers
+    return int(base_seed + 10007 * rank + 37 * worker_id)
+
+
+def _pil_to_tensor_pm1(img: Image.Image) -> torch.Tensor:
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    t = torch.from_numpy(arr).permute(2, 0, 1)  # [3,H,W] in [0,1]
+    return t * 2.0 - 1.0  # [-1,1]
+
+
+_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _raw_pil_handler(key: str, data: Any) -> Optional[Image.Image]:
+    ext = key.rsplit(".", 1)[-1].lower()
+    if ext not in _IMAGE_EXTENSIONS or not isinstance(data, (bytes, bytearray)):
+        return None
+    with io.BytesIO(data) as stream:
+        img = Image.open(stream)
+        img.load()
+    return img
+
+
+def _ensure_rgb(img: Image.Image, bg: Tuple[int, int, int] = (0, 0, 0)) -> Image.Image:
+    """
+    Convert any PIL image to RGB while correctly handling palette transparency.
+    """
+    img = ImageOps.exif_transpose(img)
+    if img.mode == "P":
+        img = img.convert("RGBA")
+    if img.mode in ("RGBA", "LA"):
+        rgba = img.convert("RGBA")
+        bg_img = Image.new("RGBA", rgba.size, (*bg, 255))
+        rgba = Image.alpha_composite(bg_img, rgba)
+        return rgba.convert("RGB")
+    return img.convert("RGB")
+
+
+def _make_wds_preprocess_fn(
+    enable_augmentation: bool,
+    augment_r: float,
+    augment_j: float,
+    base_seed: int,
+    metadata_key: str,
+):
+    """
+    Input: (pil_img, meta_dict)
+    Output: dict with fields expected by identity_collate / trainer.
+    """
+    def _fn(tup):
+        img_pil, meta = tup
+        if not isinstance(meta, dict):
+            meta = {}
+
+        character = meta.get(metadata_key)
+        if character is None:
+            character = "unknown"
+        character = str(character).strip().lower()
+
+        rng = random.Random(_wds_worker_seed(base_seed))
+
+        img_pil = _ensure_rgb(img_pil, bg=(0, 0, 0))
+        if enable_augmentation:
+            img_pil = crop_long_side_only(img_pil, r=augment_r, j=augment_j, rng=rng)
+
+        return {
+            "pixel_values": _pil_to_tensor_pm1(img_pil),
+            "text": character,
+            "character": character,
+            "data_type": "image",
+            "primary_pil": img_pil,
+            "meta": meta,
+        }
+
+    return _fn
+
+
+def _make_inverse_freq_reject_fn(
+    character_counts: Dict[str, int],
+    min_count: int,
+    base_seed: int,
+    metadata_key: str,
+):
+    """
+    Inverse-frequency rejection sampling:
+      accept with p = min(1, min_count / count(character))
+    """
+    def _accept(sample: Dict[str, Any]) -> bool:
+        character = sample.get("character", None)
+        if character is None:
+            meta = sample.get("meta", {})
+            character = meta.get(metadata_key) or "unknown"
+            character = str(character).strip().lower()
+
+        c = int(character_counts.get(character, 0))
+        if c <= 0:
+            return True
+
+        p = float(min_count) / float(c)
+        if p >= 1.0:
+            return True
+
+        rng = random.Random(_wds_worker_seed(base_seed) + 1337)
+        return rng.random() < p
+
+    return _accept
+
+
+def _make_secondary_mapper(
+    p_secondary: float,
+    base_seed: int,
+    enable_secondary: bool = True,
+    max_cache_size: int = 64,
+):
+    """
+    Streaming-friendly same-character "secondary" sampling:
+      keep a small per-worker cache: character -> last seen sample (pil/tensor).
+      With probability p_secondary, attach the previous cached sample for that character.
+    """
+    if (not enable_secondary) or p_secondary <= 0 or max_cache_size <= 0:
+        def _no_secondary(sample: Dict[str, Any]) -> Dict[str, Any]:
+            sample["secondary_pixel_values"] = None
+            sample["secondary_pil"] = None
+            sample["secondary_mask"] = False
+            return sample
+
+        return _no_secondary
+
+    # LRU cache to cap memory usage when many unique characters are present.
+    cache: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+    rng = random.Random(_wds_worker_seed(base_seed) + 4242)
+
+    def _fn(sample: Dict[str, Any]) -> Dict[str, Any]:
+        character = sample["character"]
+
+        sec = cache.get(character, None) if rng.random() < p_secondary else None
+
+        if sec is not None:
+            sample["secondary_pixel_values"] = sec
+            sample["secondary_pil"] = None
+            sample["secondary_mask"] = True
+        else:
+            sample["secondary_pixel_values"] = None
+            sample["secondary_pil"] = None
+            sample["secondary_mask"] = False
+
+        # update cache with current; enforce LRU size limit to prevent unbounded growth
+        cache[character] = sample["pixel_values"]
+        cache.move_to_end(character)
+        if len(cache) > max_cache_size:
+            cache.popitem(last=False)
+        return sample
+
+    return _fn
+
+
+def identity_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    primary = torch.stack([b["pixel_values"] for b in batch], dim=0)
+    texts = [b["text"] for b in batch]
+    characters = [b["character"] for b in batch]
+    primary_pils = [b["primary_pil"] for b in batch]
+
+    sec_mask = []
+    sec_images = []
+    sec_pils = []
+    for b in batch:
+        if b.get("secondary_pixel_values", None) is None:
+            sec_mask.append(False)
+            sec_images.append(torch.zeros_like(primary[0]))
+            sec_pils.append(None)
+        else:
+            sec_mask.append(True)
+            sec_images.append(b["secondary_pixel_values"])
+            sec_pils.append(b.get("secondary_pil", None))
+
+    secondary = torch.stack(sec_images, dim=0)
+    return {
+        "pixel_values": primary,
+        "text": texts,
+        "character": characters,
+        "data_type": "image",
+        "primary_pils": primary_pils,
+        "secondary_pixel_values": secondary,
+        "secondary_mask": torch.tensor(sec_mask, dtype=torch.bool),
+        "secondary_pils": sec_pils,
+    }
+
+
+def sync_tensor_for_sp(tensor, sp_group):
     """
     Sync tensor within sequence parallel group.
     Ensures all ranks in the SP group have the same tensor values.
@@ -291,13 +619,11 @@ def sync_tensor_for_sp(tensor: torch.Tensor, sp_group) -> torch.Tensor:
     return tensor
 
 
-
-
 class HunyuanVideoTrainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
         if "RANK" in os.environ:
             self.rank = int(os.environ["RANK"])
             self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -309,123 +635,126 @@ class HunyuanVideoTrainer:
             self.world_size = 1
             self.local_rank = 0
             self.is_main_process = True
-        
+
         if config.sp_size > self.world_size:
-            raise ValueError(
-                f"sp_size ({config.sp_size}) cannot be greater than world_size ({self.world_size})"
-            )
+            raise ValueError(f"sp_size ({config.sp_size}) cannot be greater than world_size ({self.world_size})")
         if self.world_size % config.sp_size != 0:
             raise ValueError(
                 f"sp_size ({config.sp_size}) must evenly divide world_size ({self.world_size}). "
                 f"world_size % sp_size = {self.world_size % config.sp_size}"
             )
-        
+
         initialize_parallel_state(sp=config.sp_size)
         torch.cuda.set_device(self.local_rank)
         self.parallel_state = get_parallel_state()
-        self.dp_rank = self.parallel_state.world_mesh['dp'].get_local_rank()
-        self.dp_size = self.parallel_state.world_mesh['dp'].size()
+        self.dp_rank = self.parallel_state.world_mesh["dp"].get_local_rank()
+        self.dp_size = self.parallel_state.world_mesh["dp"].size()
         self.sp_enabled = self.parallel_state.sp_enabled
         self.sp_group = self.parallel_state.sp_group if self.sp_enabled else None
 
+        self.model_dtype = torch.bfloat16 if self.config.dtype == "bf16" else torch.float32
         self._set_seed(config.seed + self.dp_rank)
-        self._build_models()
+
+        self.pipeline = self._build_pipeline()
+        self.student_transformer = self.pipeline.transformer
+        self.teacher_transformer = self._load_teacher()
+
+        if self.config.use_lora:
+            self._apply_lora()
+
+        if self.config.enable_gradient_checkpointing:
+            self._apply_gradient_checkpointing()
+
+        if self.config.enable_fsdp and self.world_size > 1:
+            self._apply_fsdp()
+
+        if self.is_main_process:
+            logger.info("building optimizer...")
         self._build_optimizer()
-        
-        self.noise_schedule = LinearInterpolationSchedule(T=config.num_train_timesteps)
-        self.timestep_sampler = TimestepSampler(
-            T=config.num_train_timesteps, 
+        if self.is_main_process:
+            logger.info("loading DINO...")
+        self.dino = DINOIdentity(
+            model_dir=self.config.dino_model_dir,
+            head_path=self.config.dino_head_path,
+            dtype=self.model_dtype,
             device=self.device,
-            snr_type=config.snr_type,
         )
-        
+
         self.global_step = 0
-        self.current_epoch = 0
-        
         if self.is_main_process:
             os.makedirs(config.output_dir, exist_ok=True)
-        
-        self.validation_output_dir = os.path.join(config.output_dir, "samples")
-        if self.is_main_process:
-            os.makedirs(self.validation_output_dir, exist_ok=True)
-        
-        if config.validation_prompts is None:
-            config.validation_prompts = ["A beautiful sunset over the ocean with waves gently crashing on the shore"]
-    
+            os.makedirs(os.path.join(config.output_dir, "samples"), exist_ok=True)
+
+        if config.resume_from_checkpoint:
+            self.load_checkpoint(config.resume_from_checkpoint)
+
     def _set_seed(self, seed: int):
         random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-    
-    def _build_models(self):
-        if self.config.dtype == "bf16":
-            transformer_dtype = torch.bfloat16
-        elif self.config.dtype == "fp32":
-            transformer_dtype = torch.float32
-        else:
-            raise ValueError(f"Unsupported dtype: {self.config.dtype}")
-        
-        # Don't create SR pipeline for training (validation uses enable_sr=False)
-        self.pipeline = HunyuanVideo_1_5_Pipeline.create_pipeline(
-            pretrained_model_name_or_path=self.config.pretrained_model_root,
-            transformer_version=self.config.pretrained_transformer_version,
-            transformer_dtype=transformer_dtype,
+
+    def _build_pipeline(self):
+        pipeline = HunyuanVideo_1_5_Pipeline.create_pipeline(
+            pretrained_model_name_or_path=self.config.pipeline_dir,
+            transformer_version=self.config.transformer_version,
+            transformer_dtype=self.model_dtype,
             enable_offloading=False,
             enable_group_offloading=False,
             overlap_group_offloading=False,
             create_sr_pipeline=False,
-            flow_shift=self.config.validation_timestep_shift,
+            flow_shift=1.0,
             device=self.device,
         )
-        
-        self.transformer = self.pipeline.transformer
-        self.vae = self.pipeline.vae
-        self.text_encoder = self.pipeline.text_encoder
-        self.text_encoder_2 = self.pipeline.text_encoder_2
-        self.vision_encoder = self.pipeline.vision_encoder
-        self.byt5_kwargs = {
-            "byt5_model": self.pipeline.byt5_model,
-            "byt5_tokenizer": self.pipeline.byt5_tokenizer,
-        }
-        
-        self.transformer.train()
+        text_encoder, text_encoder_2 = HunyuanVideo_1_5_Pipeline._load_text_encoders(
+            self.config.pipeline_dir, device=self.device
+        )
+        pipeline.text_encoder = text_encoder
+        pipeline.text_encoder_2 = text_encoder_2
+        byt5_kwargs, prompt_format = HunyuanVideo_1_5_Pipeline._load_byt5(
+            self.config.pipeline_dir,
+            glyph_byT5_v2=pipeline.config.glyph_byT5_v2,
+            byt5_max_length=pipeline.config.byt5_max_length if hasattr(pipeline.config, "byt5_max_length") else 256,
+            device=self.device,
+        )
+        pipeline.byt5_model = byt5_kwargs["byt5_model"]
+        pipeline.byt5_tokenizer = byt5_kwargs["byt5_tokenizer"]
+        pipeline.prompt_format = prompt_format
+        pipeline.scheduler = FlowMatchDiscreteScheduler.from_pretrained(os.path.join(self.config.pipeline_dir, "scheduler"))
+        pipeline.target_dtype = self.model_dtype
+        pipeline.execution_device = self.device
+        self.vae = pipeline.vae
+        self.text_encoder = pipeline.text_encoder
+        self.text_encoder_2 = pipeline.text_encoder_2
+        self.vision_encoder = pipeline.vision_encoder
+        self.byt5_kwargs = {"byt5_model": pipeline.byt5_model, "byt5_tokenizer": pipeline.byt5_tokenizer}
+        self.scheduler_config = pipeline.scheduler.config
+        return pipeline
 
-        if self.config.use_lora:
-            self._apply_lora()
-        
-        if self.config.enable_gradient_checkpointing:
-            self._apply_gradient_checkpointing()
-        
-        if self.config.enable_fsdp and self.world_size > 1:
-            self._apply_fsdp()
-        
-        if self.is_main_process:
-            logger.info(f"Models loaded. Transformer dtype: {transformer_dtype}")
-            total_params = sum(p.numel() for p in self.transformer.parameters())
-            trainable_params = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
-            logger.info(f"Transformer parameters: {total_params:,} (trainable: {trainable_params:,})")
-            logger.info(f"LoRA enabled: {self.config.use_lora}")
-            logger.info(f"FSDP enabled: {self.config.enable_fsdp and self.world_size > 1}")
-            logger.info(f"Gradient checkpointing enabled: {self.config.enable_gradient_checkpointing}")
-            logger.info(f"Timestep sampling strategy: {self.config.snr_type.value}")
-    
+    def _load_teacher(self):
+        transformer_path = os.path.join(self.config.pipeline_dir, "transformer", self.config.transformer_version)
+        teacher = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
+            transformer_path, low_cpu_mem_usage=True, torch_dtype=self.model_dtype
+        ).to(self.device)
+        teacher.eval()
+        teacher.requires_grad_(False)
+        return teacher
+
     def _apply_lora(self):
         if self.is_main_process:
-            logger.info("Applying LoRA to transformer using PeftAdapterMixin...")
-        
-        if self.config.pretrained_lora_path is not None:
-            if self.is_main_process:
-                logger.info(f"Loading pretrained LoRA from {self.config.pretrained_lora_path}")
-            self.load_pretrained_lora(self.config.pretrained_lora_path)
+            logger.info("Applying LoRA adapters to student transformer")
+        from peft import LoraConfig
+
+        target_modules = self.config.lora_target_modules or DEFAULT_LORA_TARGETS
+        self.student_transformer.requires_grad_(False)
+
+        if self.config.pretrained_lora_path:
+            self.student_transformer.load_lora_adapter(
+                pretrained_model_name_or_path_or_dict=self.config.pretrained_lora_path,
+                adapter_name="default",
+                use_safetensors=True,
+            )
         else:
-            from peft import LoraConfig
-            
-            if self.config.lora_target_modules is None:
-                target_modules = "all-linear"
-            else:
-                target_modules = self.config.lora_target_modules
-            
             lora_config = LoraConfig(
                 r=self.config.lora_r,
                 lora_alpha=self.config.lora_alpha,
@@ -434,30 +763,26 @@ class HunyuanVideoTrainer:
                 bias="none",
                 task_type="FEATURE_EXTRACTION",
             )
-            
-            self.transformer.add_adapter(lora_config, adapter_name="default")
+            self.student_transformer.add_adapter(lora_config, adapter_name="default")
 
-        
+        for name, param in self.student_transformer.named_parameters():
+            if "lora_" in name or "adapter" in name:
+                param.requires_grad = True
+
         if self.is_main_process:
-            trainable_params = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in self.transformer.parameters())
-            logger.info(f"LoRA applied successfully. Trainable parameters: {trainable_params:,} / {total_params:,} "
-                       f"({100 * trainable_params / total_params:.2f}%)")
-    
+            total_params = sum(p.numel() for p in self.student_transformer.parameters())
+            trainable_params = sum(p.numel() for p in self.student_transformer.parameters() if p.requires_grad)
+            logger.info(f"LoRA trainable params: {trainable_params:,} / {total_params:,}")
+
     def _apply_fsdp(self):
         if self.is_main_process:
-            logger.info("Applying FSDP2 to transformer...")
-        
-        param_dtype = torch.bfloat16
-        reduce_dtype = torch.float32  # Reduce in float32 for stability
+            logger.info("Applying FSDP2 to student transformer...")
 
-        self.transformer = self.transformer.to(dtype=param_dtype)
-        
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
+            param_dtype=self.model_dtype,
+            reduce_dtype=torch.float32,
         )
-        
+
         fsdp_config = {"mp_policy": mp_policy}
         if self.world_size > 1:
             try:
@@ -465,89 +790,71 @@ class HunyuanVideoTrainer:
             except Exception as e:
                 if self.is_main_process:
                     logger.warning(f"Could not create DeviceMesh: {e}. FSDP will use process group instead.")
-        
-        for block in list(self.transformer.double_blocks) + list(self.transformer.single_blocks):
+
+        for block in list(self.student_transformer.double_blocks) + list(self.student_transformer.single_blocks):
             if block is not None:
                 fully_shard(block, **fsdp_config)
-        
-        fully_shard(self.transformer, **fsdp_config)
-        
-        if self.is_main_process:
-            logger.info("FSDP2 applied successfully")
-    
+
+        fully_shard(self.student_transformer, **fsdp_config)
+
     def _apply_gradient_checkpointing(self):
-        if self.is_main_process:
-            logger.info("Applying gradient checkpointing to transformer blocks...")
-        
         no_split_module_type = None
-        for block in self.transformer.double_blocks:
+        for block in self.student_transformer.double_blocks:
             if block is not None:
                 no_split_module_type = type(block)
                 break
-        
         if no_split_module_type is None:
-            for block in self.transformer.single_blocks:
+            for block in self.student_transformer.single_blocks:
                 if block is not None:
                     no_split_module_type = type(block)
                     break
-        
         if no_split_module_type is None:
             logger.warning("Could not find block type for gradient checkpointing. Using fallback.")
-            if hasattr(self.transformer, "gradient_checkpointing_enable"):
-                self.transformer.gradient_checkpointing_enable()
+            if hasattr(self.student_transformer, "gradient_checkpointing_enable"):
+                self.student_transformer.gradient_checkpointing_enable()
             return
-        
+
         def non_reentrant_wrapper(module):
-            return checkpoint_wrapper(
-                module,
-                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-            )
-        
+            return checkpoint_wrapper(module, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+
         def selective_checkpointing(submodule):
             return isinstance(submodule, no_split_module_type)
-        
+
         apply_activation_checkpointing(
-            self.transformer,
+            self.student_transformer,
             checkpoint_wrapper_fn=non_reentrant_wrapper,
             check_fn=selective_checkpointing,
         )
-        
-        if self.is_main_process:
-            logger.info("Gradient checkpointing applied successfully")
-    
+
     def _build_optimizer(self):
+        params = [p for p in self.student_transformer.parameters() if p.requires_grad]
         if self.config.use_muon:
             self.optimizer = get_muon_optimizer(
-                model=self.transformer,
+                model=self.student_transformer,
                 lr=self.config.learning_rate,
                 weight_decay=self.config.weight_decay,
             )
         else:
-            trainable_params = list(self.transformer.parameters())
             self.optimizer = torch.optim.AdamW(
-                trainable_params,
+                params,
                 lr=self.config.learning_rate,
                 betas=(0.9, 0.999),
                 eps=1e-8,
                 weight_decay=self.config.weight_decay,
             )
-        
         self.lr_scheduler = get_scheduler(
-            "constant",
+            "cosine",
             optimizer=self.optimizer,
-            num_warmup_steps=self.config.warmup_steps * self.world_size,
-            num_training_steps=self.config.max_steps * self.world_size,
+            num_warmup_steps=self.config.warmup_steps,
+            num_training_steps=self.config.max_train_steps,
         )
-        
-        if self.is_main_process:
-            logger.info(f"Optimizer and scheduler initialized")
-    
-    def encode_text(self, prompts, data_type: str = "image"):
+
+    def encode_text(self, prompts: List[str], data_type: str = "video"):
         text_inputs = self.text_encoder.text2tokens(prompts, data_type=data_type)
         text_outputs = self.text_encoder.encode(text_inputs, data_type=data_type, device=self.device)
         text_emb = text_outputs.hidden_state
         text_mask = text_outputs.attention_mask
-        
+
         text_emb_2 = None
         text_mask_2 = None
         if self.text_encoder_2 is not None:
@@ -555,673 +862,1012 @@ class HunyuanVideoTrainer:
             text_outputs_2 = self.text_encoder_2.encode(text_inputs_2, device=self.device)
             text_emb_2 = text_outputs_2.hidden_state
             text_mask_2 = text_outputs_2.attention_mask
-        
         return text_emb, text_mask, text_emb_2, text_mask_2
-    
-    def encode_byt5(self, text_ids: torch.Tensor, attention_mask: torch.Tensor):
-        if self.byt5_kwargs["byt5_model"] is None:
-            return None, None
-        byt5_outputs = self.byt5_kwargs["byt5_model"](text_ids, attention_mask=attention_mask.float())
-        byt5_emb = byt5_outputs[0]
-        return byt5_emb, attention_mask
-    
-    def encode_images(self, images):
-        """Encode images to vision states (for i2v)"""
-        if self.vision_encoder is None:
-            return None
-        assert images.max() <= 1.0 and images.min() >= -1.0, f"Images must be in the range [-1, 1], but got {images.min()} {images.max()}"
-        images = (images + 1) / 2 # [-1, 1] -> [0, 1]
-        images_np = (images.cpu().permute(0, 2, 3, 1).numpy() * 255).clip(0, 255).astype("uint8")
-        vision_states = self.vision_encoder.encode_images(images_np)
-        return vision_states.last_hidden_state.to(device=self.device, dtype=self.transformer.dtype)
-    
-    def encode_vae(self, images: torch.Tensor) -> torch.Tensor:
-        if images.max() > 1.0 or images.min() < -1.0:
-            raise ValueError(f"Images must be in the range [-1, 1], but got {images.min()} {images.max()}")
-        
-        if images.ndim == 4:
-            images = images.unsqueeze(2)
-        
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
-            latents = self.vae.encode(images).latent_dist.sample()
-            if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
-                latents = (latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-            else:
-                latents = latents * self.vae.config.scaling_factor
-        
-        return latents
-    
-    def get_condition(self, latents: torch.Tensor, task_type: str) -> torch.Tensor:
-        b, c, f, h, w = latents.shape
-        cond = torch.zeros([b, c + 1, f, h, w], device=latents.device, dtype=latents.dtype)
-        
-        if task_type == "t2v":
-            return cond
-        elif task_type == "i2v":
-            cond[:, :-1, :1] = latents[:, :, :1]
-            cond[:, -1, 0] = 1
-            return cond
-        else:
-            raise ValueError(f"Unsupported task type: {task_type}")
-    
-    def sample_task(self, data_type: str) -> str:
-        """
-        Sample task type based on data type and configuration.
-        
-        For video data: samples between t2v and i2v based on i2v_prob
-        For image data: always returns t2v (image-to-video generation)
-        """
-        if data_type == "image":
-            return "t2v"
-        elif data_type == "video":
-            if random.random() < self.config.i2v_prob:
-                return "i2v"
-            else:
-                return "t2v"
-        else:
-            return "t2v"
-    
-    def prepare_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Prepare batch for training.
-        
-        Expected batch format:
-        {
-            "pixel_values": torch.Tensor, # [B, C, F, H, W] for video or [B, C, H, W] for image
-                                          # Pixel values must be in range [-1, 1] 
-            "text": List[str],
-            "data_type": str,  # "image" or "video"
-            "byt5_text_ids": Optional[torch.Tensor],
-            "byt5_text_mask": Optional[torch.Tensor],
-        }
-        
-        Note: For video data, the temporal dimension F must be 4n+1 (e.g., 1, 5, 9, 13, 17, ...)
-        to satisfy VAE requirements. The dataset should ensure this before returning data.
-        
-        """
-        if 'latents' in batch:
-            latents = batch['latents'].to(self.device)
-            images = None
-        else:
-            images = batch["pixel_values"].to(self.device)
 
-            latents = self.encode_vae(images)
-        
-        if self.sp_enabled:
-            latents = sync_tensor_for_sp(latents, self.sp_group)
-            if images is not None:
-                images = sync_tensor_for_sp(images, self.sp_group)
-        
-        data_type_raw = batch.get("data_type", "image")
-        if isinstance(data_type_raw, list):
-            data_type = data_type_raw[0]
-        elif isinstance(data_type_raw, str):
-            data_type = data_type_raw
-        else:
-            data_type = str(data_type_raw) if data_type_raw is not None else "image"
-        task_type = self.sample_task(data_type)
-
-        if self.sp_enabled:
-            task_type = sync_tensor_for_sp(task_type, self.sp_group)
-        
-        cond_latents = self.get_condition(latents, task_type)
-        prompts = batch["text"]
-        if self.sp_enabled:
-            prompts = sync_tensor_for_sp(prompts, self.sp_group)
-        text_emb, text_mask, text_emb_2, text_mask_2 = self.encode_text(prompts, data_type=data_type)
-        
-        byt5_text_states = None
-        byt5_text_mask = None
-        if self.byt5_kwargs["byt5_model"] is not None:
-            if "byt5_text_ids" in batch and batch["byt5_text_ids"] is not None:
-                byt5_text_ids = batch["byt5_text_ids"].to(self.device)
-                byt5_text_mask = batch["byt5_text_mask"].to(self.device)
-                if self.sp_enabled:
-                    byt5_text_ids = sync_tensor_for_sp(byt5_text_ids, self.sp_group)
-                    byt5_text_mask = sync_tensor_for_sp(byt5_text_mask, self.sp_group)
-                byt5_text_states, byt5_text_mask = self.encode_byt5(byt5_text_ids, byt5_text_mask)
-            else:
-                byt5_embeddings_list = []
-                byt5_mask_list = []
-                for prompt in prompts:
-                    emb, mask = self.pipeline._process_single_byt5_prompt(prompt, self.device)
-                    byt5_embeddings_list.append(emb)
-                    byt5_mask_list.append(mask)
-                
-                byt5_text_states = torch.cat(byt5_embeddings_list, dim=0)
-                byt5_text_mask = torch.cat(byt5_mask_list, dim=0)
-        
-        vision_states = None
-        if task_type == "i2v":
-            assert images is not None, '`pixel_values` must be provided for i2v task'
-            if images.ndim == 5:
-                first_frame = images[:, :, 0, :, :]
-            else:
-                first_frame = images
-            vision_states = self.encode_images(first_frame)
-        
-        noise = torch.randn_like(latents)
-        timesteps = self.timestep_sampler.sample(latents.shape[0], device=self.device)
-        timesteps = timestep_transform(timesteps, self.config.num_train_timesteps, self.config.train_timestep_shift)
-        
-        latents_noised = self.noise_schedule.forward(latents, noise, timesteps)
-        target = noise - latents
-        
-        if self.sp_enabled:
-            target = sync_tensor_for_sp(target, self.sp_group)
-        
-        return {
-            "latents_noised": latents_noised,
-            "cond_latents": cond_latents,
-            "timesteps": timesteps,
-            "target": target,
-            "text_emb": text_emb,
-            "text_emb_2": text_emb_2,
-            "text_mask": text_mask,
-            "text_mask_2": text_mask_2,
-            "byt5_text_states": byt5_text_states,
-            "byt5_text_mask": byt5_text_mask,
-            "vision_states": vision_states,
-            "task_type": task_type,
-            "data_type": data_type,
-        }
-    
-    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
-        inputs = self.prepare_batch(batch)
-        latents_input = torch.cat([inputs["latents_noised"], inputs["cond_latents"]], dim=1)
-        model_dtype = torch.bfloat16 if self.config.dtype == "bf16" else torch.float32
-        
+    def _prepare_conditions(self, batch: Dict[str, Any], video_length: int):
+        prompts = [build_prompt.build_prompt(c) for c in batch["character"]]
+        text_emb, text_mask, text_emb_2, text_mask_2 = self.encode_text(prompts, data_type="video")
         extra_kwargs = {}
-        if inputs["byt5_text_states"] is not None:
-            extra_kwargs["byt5_text_states"] = inputs["byt5_text_states"].to(dtype=model_dtype)
-            extra_kwargs["byt5_text_mask"] = inputs["byt5_text_mask"]
-        
-        with torch.autocast(device_type="cuda", dtype=model_dtype, enabled=(model_dtype == torch.bfloat16)):
-            model_pred = self.transformer(
-                latents_input.to(dtype=model_dtype),
-                inputs["timesteps"],
-                text_states=inputs["text_emb"].to(dtype=model_dtype),
-                text_states_2=inputs["text_emb_2"].to(dtype=model_dtype) if inputs["text_emb_2"] is not None else None,
-                encoder_attention_mask=inputs["text_mask"].to(dtype=model_dtype),
-                vision_states=inputs["vision_states"].to(dtype=model_dtype) if inputs["vision_states"] is not None else None,
-                mask_type=inputs["task_type"],
-                extra_kwargs=extra_kwargs if extra_kwargs else None,
+        if getattr(self.pipeline.config, "glyph_byT5_v2", False):
+            with torch.no_grad():
+                extra_kwargs = self.pipeline._prepare_byt5_embeddings(prompts, device=self.device)
+
+        batch_size = batch["pixel_values"].shape[0]
+        primary_pils: List[Image.Image] = batch["primary_pils"]
+        height, width = self.pipeline.get_closest_resolution_given_reference_image(
+            primary_pils[0], self.config.train_target_resolution
+        )
+        latent_target_length, latent_height, latent_width = self.pipeline.get_latent_size(
+            video_length, height, width
+        )
+
+        latents = self.pipeline.prepare_latents(
+            batch_size,
+            self.student_transformer.config.in_channels,
+            latent_height,
+            latent_width,
+            latent_target_length,
+            self.model_dtype,
+            self.device,
+            generator=None,
+        )
+
+        cond_latents_list = []
+        for pil in primary_pils:
+            cond_latents_list.append(self.pipeline.get_image_condition_latents("i2v", pil, height, width))
+        cond_latents = torch.cat(cond_latents_list, dim=0)
+        multitask_mask = self.pipeline.get_task_mask("i2v", latent_target_length)
+        cond_latents = self.pipeline._prepare_cond_latents(
+            "i2v", cond_latents.to(self.device), latents, multitask_mask.to(self.device)
+        )
+
+        vision_states = None
+        if self.vision_encoder is not None:
+            vs_list = []
+            for pil in primary_pils:
+                img_np = np.array(pil)
+                vs = self.vision_encoder.encode_images(img_np)
+                # vs.last_hidden_state is typically [1, T, D]
+                vs_list.append(vs.last_hidden_state.to(device=self.device, dtype=self.model_dtype))
+            vision_states = torch.cat(vs_list, dim=0)  # [B, T, D]
+
+        return {
+            "latents": latents,
+            "cond_latents": cond_latents,
+            "vision_states": vision_states,
+            "text_emb": text_emb,
+            "text_mask": text_mask,
+            "text_emb_2": text_emb_2,
+            "text_mask_2": text_mask_2,
+            "extra_kwargs": extra_kwargs,
+            "prompts": prompts,
+            "height": height,
+            "width": width,
+            "latent_target_length": latent_target_length,
+        }
+
+    def _new_scheduler(self):
+        return FlowMatchDiscreteScheduler.from_config(self.scheduler_config)
+
+    def _select_harvest_indices(self, num_steps: int) -> Tuple[List[int], int]:
+        if num_steps <= 0:
+            return [], 0
+        indices: List[int] = []
+        if self.config.harvest_scheme == "random":
+            indices = sorted(random.sample(range(num_steps), k=min(self.config.harvest_count, num_steps)))
+        else:
+            base_fracs = [0.5, 0.25]
+            jitter = max(1, int(num_steps * self.config.harvest_jitter_frac))
+            for frac in base_fracs:
+                idx = int(round(frac * (num_steps - 1)))
+                idx += random.randint(-jitter, jitter)
+                idx = min(max(idx, 0), num_steps - 1)
+                indices.append(idx)
+            indices = sorted(set(indices))
+            if self.config.harvest_count < len(indices):
+                indices = indices[: self.config.harvest_count]
+
+        low = int(self.config.id_timestep_frac_low * (num_steps - 1))
+        high = int(self.config.id_timestep_frac_high * (num_steps - 1))
+        id_idx = min(num_steps - 1, max(low, random.randint(low, max(low, high))))
+        if id_idx not in indices:
+            indices.append(id_idx)
+            indices = sorted(set(indices))
+        return indices, id_idx
+
+    def _teacher_rollout(
+        self,
+        latents: torch.Tensor,
+        cond_latents: torch.Tensor,
+        text_emb: torch.Tensor,
+        text_mask: torch.Tensor,
+        text_emb_2: Optional[torch.Tensor],
+        text_mask_2: Optional[torch.Tensor],
+        vision_states: Optional[torch.Tensor],
+        extra_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Roll teacher from T down to t_deep (id_idx) only.
+        Harvest along the way (<= id_idx), and stop at id_idx (do not continue to 0).
+        """
+        scheduler = self._new_scheduler()
+        scheduler.set_timesteps(self.config.num_inference_steps, device=self.device)
+        timesteps = scheduler.timesteps
+        harvest_indices, id_idx = self._select_harvest_indices(len(timesteps))
+        harvest_indices = sorted([i for i in harvest_indices if i <= id_idx])
+
+        cached = []
+        identity_latents = None
+        identity_t = None
+
+        for idx, t in enumerate(timesteps):
+            if idx > id_idx:
+                break
+
+            latents_input = torch.cat([latents, cond_latents], dim=1)
+            t_expand = t.repeat(latents_input.shape[0])
+            with torch.no_grad(), torch.autocast(
+                device_type="cuda", dtype=self.model_dtype, enabled=self.model_dtype == torch.bfloat16
+            ):
+                teacher_pred = self.teacher_transformer(
+                    latents_input,
+                    t_expand,
+                    text_states=text_emb.to(self.model_dtype),
+                    text_states_2=text_emb_2.to(self.model_dtype) if text_emb_2 is not None else None,
+                    encoder_attention_mask=text_mask.to(self.model_dtype),
+                    vision_states=vision_states.to(self.model_dtype) if vision_states is not None else None,
+                    mask_type="i2v",
+                    extra_kwargs=extra_kwargs,
+                    return_dict=False,
+                )[0]
+
+            if idx in harvest_indices:
+                cached.append((latents.detach(), teacher_pred.detach(), t_expand.detach()))
+
+            if idx == id_idx:
+                identity_latents = latents.detach()
+                identity_t = t.detach()
+                break
+
+            latents = scheduler.step(teacher_pred, t_expand, latents, return_dict=False)[0]
+
+        return cached, identity_latents, identity_t, timesteps
+
+    def _distill_loss(
+        self,
+        cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        cond_latents: torch.Tensor,
+        text_emb: torch.Tensor,
+        text_mask: torch.Tensor,
+        text_emb_2: Optional[torch.Tensor],
+        text_mask_2: Optional[torch.Tensor],
+        vision_states: Optional[torch.Tensor],
+        extra_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if not cache:
+            return torch.tensor(0.0, device=self.device)
+
+        latents_inputs = []
+        timesteps = []
+        teacher_preds = []
+        for lat, teacher_pred, ts in cache:
+            latents_inputs.append(torch.cat([lat, cond_latents], dim=1))
+            timesteps.append(ts)
+            teacher_preds.append(teacher_pred)
+
+        latents_batch = torch.cat(latents_inputs, dim=0)
+        timesteps_batch = torch.cat(timesteps, dim=0)
+        teacher_batch = torch.cat(teacher_preds, dim=0)
+
+        rep = latents_batch.shape[0] // text_emb.shape[0]
+        text_emb_exp = text_emb.repeat_interleave(rep, dim=0)
+        text_mask_exp = text_mask.repeat_interleave(rep, dim=0) if text_mask is not None else None
+        text_emb_2_exp = text_emb_2.repeat_interleave(rep, dim=0) if text_emb_2 is not None else None
+        text_mask_2_exp = text_mask_2.repeat_interleave(rep, dim=0) if text_mask_2 is not None else None
+        vision_states_exp = vision_states.repeat_interleave(rep, dim=0) if vision_states is not None else None
+        extra_kwargs_exp = extra_kwargs
+        if extra_kwargs is not None and "byt5_text_states" in extra_kwargs:
+            extra_kwargs_exp = {
+                "byt5_text_states": extra_kwargs["byt5_text_states"].repeat_interleave(rep, dim=0),
+                "byt5_text_mask": extra_kwargs["byt5_text_mask"].repeat_interleave(rep, dim=0),
+            }
+
+        with torch.autocast(device_type="cuda", dtype=self.model_dtype, enabled=self.model_dtype == torch.bfloat16):
+            student_pred = self.student_transformer(
+                latents_batch.to(self.model_dtype),
+                timesteps_batch,
+                text_states=text_emb_exp.to(self.model_dtype),
+                text_states_2=text_emb_2_exp.to(self.model_dtype) if text_emb_2_exp is not None else None,
+                encoder_attention_mask=text_mask_exp.to(self.model_dtype) if text_mask_exp is not None else None,
+                vision_states=vision_states_exp.to(self.model_dtype) if vision_states_exp is not None else None,
+                mask_type="i2v",
+                extra_kwargs=extra_kwargs_exp,
                 return_dict=False,
             )[0]
-        
-        target = inputs["target"].to(dtype=model_pred.dtype)
-        loss = nn.functional.mse_loss(model_pred, target)
-        
-        if self.sp_enabled:
-            loss = sync_tensor_for_sp(loss, self.sp_group)
-        
-        loss = loss / self.config.gradient_accumulation_steps
-        loss.backward()
-        
+
+        mse = ((student_pred - teacher_batch.to(student_pred.dtype)) ** 2).mean()
+        return mse
+
+    def _downsample_latents_hw(self, latents: torch.Tensor, scale: float, mode: str) -> torch.Tensor:
+        mode = mode.lower()
+        if mode == "false" or scale is None or scale >= 1.0:
+            return latents
+        if scale <= 0:
+            raise ValueError(f"id_decode_scale must be > 0, got {scale}")
+
+        orig_dtype = latents.dtype
+        if latents.ndim == 5:
+            b, c, t, h, w = latents.shape
+            latents_4d = latents.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+            has_time = True
+        elif latents.ndim == 4:
+            latents_4d = latents
+            has_time = False
+        else:
+            return latents
+
+        if latents_4d.dtype not in (torch.float16, torch.float32):
+            latents_4d = latents_4d.float()
+
+        if mode == "area":
+            latents_4d = F.interpolate(latents_4d, scale_factor=scale, mode="area")
+        elif mode == "bicubic":
+            latents_4d = F.interpolate(
+                latents_4d,
+                scale_factor=scale,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        else:
+            raise ValueError(f"Unsupported id_decode_downsample_mode: {mode}")
+
+        if latents_4d.dtype != orig_dtype:
+            latents_4d = latents_4d.to(orig_dtype)
+
+        if has_time:
+            h2, w2 = latents_4d.shape[-2:]
+            latents_4d = latents_4d.reshape(b, t, c, h2, w2).permute(0, 2, 1, 3, 4)
+        return latents_4d
+
+    def _decode_latents(
+        self,
+        latents: torch.Tensor,
+        downsample_mode: Optional[str] = None,
+        downsample_scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        if downsample_mode is not None and downsample_mode != "false":
+            latents = self._downsample_latents_hw(latents, downsample_scale, downsample_mode)
+        if latents.ndim == 4:
+            latents = latents.unsqueeze(2)
+        if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
+            latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
+        else:
+            latents = latents / self.vae.config.scaling_factor
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+            self.vae.enable_tiling()
+            video = self.vae.decode(latents, return_dict=False)[0]
+            self.vae.disable_tiling()
+        return (video / 2 + 0.5).clamp(0, 1)
+
+    def _sample_frame_indices(self, num_frames: int) -> List[int]:
+        if num_frames <= 1:
+            return [0]
+        rng = random
+        buckets = [
+            (1, max(1, int(0.10 * num_frames))),
+            (int(0.10 * num_frames), max(1, int(0.30 * num_frames))),
+            (int(0.30 * num_frames), max(1, int(0.60 * num_frames))),
+            (int(0.60 * num_frames), num_frames - 1),
+            (1, max(1, int(0.20 * num_frames))),
+        ]
+        indices = []
+        for start, end in buckets[: self.config.id_num_frames]:
+            start = min(start, num_frames - 1)
+            end = max(start + 1, end)
+            idx = rng.randint(start, end - 1)
+            if idx not in indices:
+                indices.append(idx)
+        while len(indices) < self.config.id_num_frames:
+            idx = rng.randint(0, num_frames - 1)
+            if idx not in indices:
+                indices.append(idx)
+        return sorted(indices)
+
+    def _identity_cosine_stats(
+        self,
+        identity_latents: torch.Tensor,
+        cond_latents: torch.Tensor,
+        identity_t: torch.Tensor,
+        text_emb: torch.Tensor,
+        text_mask: torch.Tensor,
+        text_emb_2: Optional[torch.Tensor],
+        text_mask_2: Optional[torch.Tensor],
+        vision_states: Optional[torch.Tensor],
+        anchors: torch.Tensor,
+        extra_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          cos_mean: scalar tensor
+          cos_std:  scalar tensor
+        """
+        scheduler = self._new_scheduler()
+        scheduler.set_timesteps(self.config.num_inference_steps, device=self.device)
+
+        latents = identity_latents
+        latents_input = torch.cat([latents, cond_latents], dim=1)
+        t_expand = identity_t.repeat(latents_input.shape[0])
+
+        with torch.autocast(device_type="cuda", dtype=self.model_dtype, enabled=self.model_dtype == torch.bfloat16):
+            pred = self.student_transformer(
+                latents_input,
+                t_expand,
+                text_states=text_emb.to(self.model_dtype),
+                text_states_2=text_emb_2.to(self.model_dtype) if text_emb_2 is not None else None,
+                encoder_attention_mask=text_mask.to(self.model_dtype) if text_mask is not None else None,
+                vision_states=vision_states.to(self.model_dtype) if vision_states is not None else None,
+                mask_type="i2v",
+                extra_kwargs=extra_kwargs,
+                return_dict=False,
+            )[0]
+
+        # Recover x0 estimate using linear blend formula: x0 = x_t - s * pred
+        s = (identity_t.float() / float(self.scheduler_config.num_train_timesteps)).view(
+            -1, *([1] * (latents.dim() - 1))
+        )
+        latents_x0 = latents - s * pred.to(latents.dtype)
+
+        video = self._decode_latents(
+            latents_x0,
+            downsample_mode=self.config.id_decode_downsample_mode,
+            downsample_scale=self.config.id_decode_scale,
+        )
+        frame_indices = self._sample_frame_indices(video.shape[2])
+
+        all_cos = []
+        for b in range(video.shape[0]):
+            frames = video[b, :, frame_indices, :, :]                # [3, K, H, W]
+            frames = frames.permute(1, 0, 2, 3).contiguous()         # [K, 3, H, W]
+
+            anchor = anchors[b : b + 1]                              # [1, 3, H, W]
+            emb_anchor = self.dino(anchor)
+            emb_frames = self.dino(frames)
+
+            cos = (emb_frames * emb_anchor).sum(dim=-1)              # [K]
+            all_cos.append(cos)
+
+        cos_all = torch.cat(all_cos, dim=0) if len(all_cos) > 0 else torch.tensor([0.0], device=self.device)
+        return cos_all.mean(), cos_all.std(unbiased=False)
+
+    def _identity_loss(
+        self,
+        identity_latents: torch.Tensor,
+        cond_latents: torch.Tensor,
+        identity_t: torch.Tensor,
+        text_emb: torch.Tensor,
+        text_mask: torch.Tensor,
+        text_emb_2: Optional[torch.Tensor],
+        text_mask_2: Optional[torch.Tensor],
+        vision_states: Optional[torch.Tensor],
+        anchors: torch.Tensor,
+        extra_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        cos_mean, _ = self._identity_cosine_stats(
+            identity_latents=identity_latents,
+            cond_latents=cond_latents,
+            identity_t=identity_t,
+            text_emb=text_emb,
+            text_mask=text_mask,
+            text_emb_2=text_emb_2,
+            text_mask_2=text_mask_2,
+            vision_states=vision_states,
+            anchors=anchors,
+            extra_kwargs=extra_kwargs,
+        )
+        return (1.0 - cos_mean).clamp(min=0.0, max=2.0)
+
+    def _lambda_id_weight(self, step: int) -> float:
+        base = self.config.lambda_id
+        if self.config.lambda_id_schedule == "constant":
+            return base
+        progress = min(1.0, float(step) / max(1, self.config.lambda_id_warmup_steps))
+        if self.config.lambda_id_schedule == "linear":
+            return base * progress
+        if self.config.lambda_id_schedule == "cosine":
+            return base * 0.5 * (1 - math.cos(math.pi * progress))
+        return base
+
+    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        self.student_transformer.train()
+        setup = self._prepare_conditions(batch, self.config.train_video_length)
+        cache, identity_latents, identity_t, _timesteps = self._teacher_rollout(
+            setup["latents"],
+            setup["cond_latents"],
+            setup["text_emb"],
+            setup["text_mask"],
+            setup["text_emb_2"],
+            setup["text_mask_2"],
+            setup["vision_states"],
+            setup["extra_kwargs"],
+        )
+
+        distill_loss = self._distill_loss(
+            cache,
+            setup["cond_latents"],
+            setup["text_emb"],
+            setup["text_mask"],
+            setup["text_emb_2"],
+            setup["text_mask_2"],
+            setup["vision_states"],
+            setup["extra_kwargs"],
+        )
+
+        if identity_latents is not None and identity_t is not None and (self.global_step % self.config.id_every_steps == 0):
+            anchors = torch.where(
+                batch["secondary_mask"].view(-1, 1, 1, 1),
+                batch["secondary_pixel_values"],
+                batch["pixel_values"],
+            )
+            anchors = ((anchors.to(self.device)) + 1) / 2.0
+            id_loss = self._identity_loss(
+                identity_latents,
+                setup["cond_latents"],
+                identity_t,
+                setup["text_emb"],
+                setup["text_mask"],
+                setup["text_emb_2"],
+                setup["text_mask_2"],
+                setup["vision_states"],
+                anchors,
+                setup["extra_kwargs"],
+            )
+        else:
+            id_loss = torch.tensor(0.0, device=self.device)
+
+        lambda_id = self._lambda_id_weight(self.global_step)
+        total_loss = distill_loss + lambda_id * id_loss
+        total_loss = total_loss / self.config.gradient_accumulation_steps
+        total_loss.backward()
+
+        grad_norm = torch.tensor(0.0)
         if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
             if self.config.max_grad_norm > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.transformer.parameters(),
-                    self.config.max_grad_norm
+                    self.student_transformer.parameters(), self.config.max_grad_norm
                 )
-            else:
-                grad_norm = torch.tensor(0.0)
-            
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
-        else:
-            grad_norm = torch.tensor(0.0)
-        
-        metrics = {
-            "loss": loss.item() * self.config.gradient_accumulation_steps,
-            "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-            "lr": self.lr_scheduler.get_last_lr()[0] if hasattr(self.lr_scheduler, "get_last_lr") else self.config.learning_rate,
+
+        return {
+            "loss_total": total_loss.item() * self.config.gradient_accumulation_steps,
+            "loss_distill": distill_loss.item(),
+            "loss_id": id_loss.item(),
+            "lambda_id": lambda_id,
+            "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
+            "lr": self.lr_scheduler.get_last_lr()[0],
         }
-        
-        return metrics
-    
-    def save_checkpoint(self, step: int):
-        checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{step}")
-        transformer_dir = os.path.join(checkpoint_dir, "transformer")
-        
-        if self.is_main_process:
-            os.makedirs(checkpoint_dir, exist_ok=True)
-        if self.world_size > 1:
-            dist.barrier()
-        
-        if self.config.use_lora and hasattr(self.transformer, "save_lora_adapter"):
-            lora_dir = os.path.join(checkpoint_dir, "lora")
-            os.makedirs(lora_dir, exist_ok=True)
-            
-            if hasattr(self.transformer, "peft_config") and self.transformer.peft_config:
-                adapter_names = list(self.transformer.peft_config.keys())
-                if self.is_main_process:
-                    logger.info(f"Saving {len(adapter_names)} LoRA adapter(s): {adapter_names}")
-                
-                for adapter_name in adapter_names:
-                    adapter_dir = os.path.join(lora_dir, adapter_name)
-                    os.makedirs(adapter_dir, exist_ok=True)
-                    self.transformer.save_lora_adapter(
-                        save_directory=adapter_dir,
-                        adapter_name=adapter_name,
-                        safe_serialization=True,
-                    )
-                    if self.is_main_process:
-                        logger.info(f"LoRA adapter '{adapter_name}' saved to {adapter_dir}")
-            else:
-                raise RuntimeError("No LoRA adapter found in the model")
-            
-            if self.world_size > 1:
-                dist.barrier()
-        
-        # Save full model state dict
-        model_state_dict = get_model_state_dict(self.transformer)
-        dcp.save(
-            state_dict={"model": model_state_dict},
-            checkpoint_id=transformer_dir,
-        )
 
-        optimizer_state_dict = get_optimizer_state_dict(
-            self.transformer,
-            self.optimizer,
-        )
-        optimizer_dir = os.path.join(checkpoint_dir, "optimizer")
-        dcp.save(
-            state_dict={"optimizer": optimizer_state_dict},
-            checkpoint_id=optimizer_dir,
-        )
-        
-        if self.is_main_process:
-            training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
-            torch.save({
-                "lr_scheduler": self.lr_scheduler.state_dict(),
-                "global_step": step,
-            }, training_state_path)
-        
-        if self.world_size > 1:
-            dist.barrier()
-        
-        if self.is_main_process:
-            logger.info(f"Checkpoint saved at step {step} to {checkpoint_dir}")
+    def validate(self, val_loader):
+        """
+        Metrics (rank 0 only), aligned with your spec:
+          1) DINO similarity over time: mean/std of cosine(anchor, sampled-frame-embeddings)
+          2) motion metric (simple): mean absolute frame-to-frame difference
+          3) teacher deviation (distill MSE) on held-out prompts (val split)
+        """
+        if not self.config.enable_validation or not self.is_main_process:
+            return
+        if val_loader is None:
+            logger.warning("Validation enabled but no val_loader was provided.")
+            return
 
-    def load_pretrained_lora(self, lora_dir: str):
-        self.transformer.load_lora_adapter(
-            pretrained_model_name_or_path_or_dict=lora_dir,
-            prefix=None,
-            adapter_name="default",
-            use_safetensors=True,
-            hotswap=False,
-        )
-    
-    def load_checkpoint(self, checkpoint_path: str):
-        if not os.path.exists(checkpoint_path):
-            raise ValueError(f"Checkpoint path does not exist: {checkpoint_path}")
-        
-        if self.is_main_process:
-            logger.info(f"Loading checkpoint from {checkpoint_path}")
-        
-        if self.world_size > 1:
-            dist.barrier()
-        
-        
-        transformer_dir = os.path.join(checkpoint_path, "transformer")
-        if os.path.exists(transformer_dir):
-            model_state_dict = get_model_state_dict(self.transformer)
-            dcp.load(
-                state_dict={"model": model_state_dict},
-                checkpoint_id=transformer_dir,
-            )
-            if self.is_main_process:
-                logger.info("Transformer model state loaded")
-        else:
-            logger.warning(f"Transformer dcp checkpoint not found from {checkpoint_path}")
+        self.student_transformer.eval()
+        metrics = {
+            "distill_mse": [],
+            "dino_cos_mean": [],
+            "dino_cos_std": [],
+            "motion": [],
+        }
 
-        optimizer_dir = os.path.join(checkpoint_path, "optimizer")
-        if os.path.exists(optimizer_dir):
-            optimizer_state_dict = get_optimizer_state_dict(
-                self.transformer,
-                self.optimizer,
-            )
-            dcp.load(
-                state_dict={"optimizer": optimizer_state_dict},
-                checkpoint_id=optimizer_dir,
-            )
-            if self.is_main_process:
-                logger.info("Optimizer state loaded")
-        
-        training_state_path = os.path.join(checkpoint_path, "training_state.pt")
-        if os.path.exists(training_state_path):
-            if self.is_main_process:
-                training_state = torch.load(training_state_path, map_location=self.device)
-                self.lr_scheduler.load_state_dict(training_state["lr_scheduler"])
-                self.global_step = training_state.get("global_step", 0)
-                logger.info(f"Training state loaded: global_step={self.global_step}")
-            else:
-                # Non-main processes will get global_step via broadcast
-                self.global_step = 0
-        
-        if self.world_size > 1:
-            global_step_tensor = torch.tensor(self.global_step, device=self.device)
-            dist.broadcast(global_step_tensor, src=0)
-            self.global_step = global_step_tensor.item()
-        
-        if self.world_size > 1:
-            dist.barrier()
-        
-        if self.is_main_process:
-            logger.info(f"Checkpoint loaded successfully. Resuming from step {self.global_step}")
-    
-    def train(self, dataloader):
-        if self.is_main_process:
-            logger.info("Starting training...")
-            logger.info(f"Max steps: {self.config.max_steps}")
-            logger.info(f"Batch size: {self.config.batch_size}")
-            logger.info(f"Learning rate: {self.config.learning_rate}")
-        
-        if self.config.resume_from_checkpoint is not None:
-            self.load_checkpoint(self.config.resume_from_checkpoint)
-        
-        self.transformer.train()
-        
-        while self.global_step < self.config.max_steps:
-            for batch in dataloader:
-                if self.global_step >= self.config.max_steps:
+        with torch.no_grad():
+            for idx, batch in enumerate(val_loader):
+                if idx >= self.config.val_num_samples:
                     break
 
-                metrics = self.train_step(batch)
-                
-                if self.global_step % self.config.log_interval == 0 and self.is_main_process:
-                    logger.info(
-                        f"Step {self.global_step}/{self.config.max_steps} | "
-                        f"Loss: {metrics['loss']:.6f} | "
-                        f"Grad Norm: {metrics['grad_norm']:.4f} | "
-                        f"LR: {metrics['lr']:.2e}"
+                setup = self._prepare_conditions(batch, self.config.val_video_length)
+
+                cache, identity_latents, identity_t, _timesteps = self._teacher_rollout(
+                    setup["latents"],
+                    setup["cond_latents"],
+                    setup["text_emb"],
+                    setup["text_mask"],
+                    setup["text_emb_2"],
+                    setup["text_mask_2"],
+                    setup["vision_states"],
+                    setup["extra_kwargs"],
+                )
+
+                distill_loss = self._distill_loss(
+                    cache,
+                    setup["cond_latents"],
+                    setup["text_emb"],
+                    setup["text_mask"],
+                    setup["text_emb_2"],
+                    setup["text_mask_2"],
+                    setup["vision_states"],
+                    setup["extra_kwargs"],
+                )
+                metrics["distill_mse"].append(distill_loss.item())
+
+                anchors = ((batch["pixel_values"].to(self.device)) + 1) / 2.0
+                if identity_latents is not None and identity_t is not None:
+                    cos_mean, cos_std = self._identity_cosine_stats(
+                        identity_latents=identity_latents,
+                        cond_latents=setup["cond_latents"],
+                        identity_t=identity_t,
+                        text_emb=setup["text_emb"],
+                        text_mask=setup["text_mask"],
+                        text_emb_2=setup["text_emb_2"],
+                        text_mask_2=setup["text_mask_2"],
+                        vision_states=setup["vision_states"],
+                        anchors=anchors,
+                        extra_kwargs=setup["extra_kwargs"],
                     )
-                
-                if self.global_step >= 0 and self.global_step % self.config.validation_interval == 0:
-                    self.validate(self.global_step)
-                
-                if (self.global_step + 1) % self.config.save_interval == 0:
-                    self.save_checkpoint(self.global_step + 1)
-                    if self.world_size > 1:
-                        dist.barrier()
-                
-                self.global_step += 1
-        
-        if self.is_main_process:
-            self.save_checkpoint(self.global_step)
-            logger.info("Training completed!")
-        
-        if self.world_size > 1:
-            dist.barrier()
-            dist.destroy_process_group()
-    
-    def validate(self, step: int):
+                    metrics["dino_cos_mean"].append(float(cos_mean.item()))
+                    metrics["dino_cos_std"].append(float(cos_std.item()))
+
+                    # motion metric on student x0 preview
+                    # (reuse the same decode path as identity metrics)
+                    scheduler = self._new_scheduler()
+                    scheduler.set_timesteps(self.config.num_inference_steps, device=self.device)
+                    latents_input = torch.cat([identity_latents, setup["cond_latents"]], dim=1)
+                    t_expand = identity_t.repeat(latents_input.shape[0])
+                    with torch.autocast(device_type="cuda", dtype=self.model_dtype, enabled=self.model_dtype == torch.bfloat16):
+                        pred = self.student_transformer(
+                            latents_input,
+                            t_expand,
+                        text_states=setup["text_emb"].to(self.model_dtype),
+                        text_states_2=setup["text_emb_2"].to(self.model_dtype) if setup["text_emb_2"] is not None else None,
+                        encoder_attention_mask=setup["text_mask"].to(self.model_dtype) if setup["text_mask"] is not None else None,
+                        vision_states=setup["vision_states"].to(self.model_dtype) if setup["vision_states"] is not None else None,
+                        mask_type="i2v",
+                        extra_kwargs=setup["extra_kwargs"],
+                        return_dict=False,
+                    )[0]
+                    s = (identity_t.float() / float(self.scheduler_config.num_train_timesteps)).view(
+                        -1, *([1] * (identity_latents.dim() - 1))
+                    )
+                    latents_x0 = identity_latents - s * pred.to(identity_latents.dtype)
+                    video = self._decode_latents(
+                        latents_x0,
+                        downsample_mode=self.config.id_decode_downsample_mode,
+                        downsample_scale=self.config.id_decode_scale,
+                    )
+
+                    if video.shape[2] > 1:
+                        motion = (video[:, :, 1:] - video[:, :, :-1]).abs().mean().item()
+                        metrics["motion"].append(motion)
+
+        def _mean(xs):
+            return sum(xs) / max(1, len(xs))
+
+        logger.info(
+            f"[val] teacher_dev(mse)={_mean(metrics['distill_mse']):.6f} | "
+            f"dino_cos_mean={_mean(metrics['dino_cos_mean']):.4f} | "
+            f"dino_cos_std={_mean(metrics['dino_cos_std']):.4f} | "
+            f"motion={_mean(metrics['motion']):.6f}"
+        )
+        self.student_transformer.train()
+
+    def _save_checkpoint_dcp(self, checkpoint_dir: str):
         """
-        Implement your own validation logic here
-        An example:
-
-
-        logger.info(f"Running validation at step {step}...")
-        
-        self.transformer.eval()
-        
+        Robust checkpointing under composable FSDP:
+          - save sharded model + optimizer with torch.distributed.checkpoint (DCP)
+        """
         try:
-            for idx, prompt in enumerate(self.config.validation_prompts):
-                logger.info(f"Generating validation video {idx+1}/{len(self.config.validation_prompts)}: {prompt[:50]}...")
-                
-                with torch.no_grad():
-                    output = self.pipeline(
-                        prompt=prompt,
-                        aspect_ratio="16:9",
-                        video_length=self.config.validate_video_length,
-                        enable_sr=False,  # Disable SR for faster validation
-                        prompt_rewrite=False,  # Disable prompt rewrite for faster validation
-                        output_type="pt",
-                        seed=42,
-                    )
-                    
-                    video_path = os.path.join(
-                        self.validation_output_dir,
-                        f"step_{step:06d}_prompt_{idx:02d}.mp4"
-                    )
-                    print(f"Prompt: {prompt}")
-                    video_to_save = output.videos
-                    if dist.get_rank() == 0:
-                        save_video(video_to_save, video_path)
-                        logger.info(f"Validation video saved to {video_path}")
-        
+            from torch.distributed.checkpoint import save as dcp_save
+            from torch.distributed.checkpoint import FileSystemWriter
         except Exception as e:
-            logger.error(f"Error during validation: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-        
-        finally:
-            self.transformer.train()
-        pass
-        """
+            if self.is_main_process:
+                logger.warning(f"DCP not available; skipping sharded checkpoint save. Error: {e}")
+            return
+
+        writer = FileSystemWriter(os.path.join(checkpoint_dir, "dcp"))
+        state = {
+            "model": self.student_transformer,
+            "optimizer": self.optimizer,
+            "lr_scheduler": self.lr_scheduler,
+            "global_step": torch.tensor([self.global_step], device="cpu"),
+        }
+        dcp_save(state, writer)
+
+    def _load_checkpoint_dcp(self, checkpoint_dir: str):
+        try:
+            from torch.distributed.checkpoint import load as dcp_load
+            from torch.distributed.checkpoint import FileSystemReader
+        except Exception as e:
+            if self.is_main_process:
+                logger.warning(f"DCP not available; skipping sharded checkpoint load. Error: {e}")
+            return False
+
+        dcp_path = os.path.join(checkpoint_dir, "dcp")
+        if not os.path.exists(dcp_path):
+            return False
+
+        reader = FileSystemReader(dcp_path)
+        state = {
+            "model": self.student_transformer,
+            "optimizer": self.optimizer,
+            "lr_scheduler": self.lr_scheduler,
+            "global_step": torch.tensor([0], device="cpu"),
+        }
+        dcp_load(state, reader)
+        self.global_step = int(state["global_step"].item())
+        return True
+
+    def save_checkpoint(self, step: int):
+        checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{step}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Use DCP for multi-rank FSDP checkpoints.
+        if self.config.enable_fsdp and self.world_size > 1:
+            self._save_checkpoint_dcp(checkpoint_dir)
+            # Only rank0 writes small training_state pointer for convenience
+            if self.is_main_process:
+                torch.save(
+                    {"global_step": step},
+                    os.path.join(checkpoint_dir, "training_state.pt"),
+                )
+            return
+
+        # Non-FSDP (or single-rank): save training state only
+        if self.is_main_process:
+            torch.save(
+                {
+                    "optimizer": self.optimizer.state_dict(),
+                    "lr_scheduler": self.lr_scheduler.state_dict(),
+                    "global_step": step,
+                },
+                os.path.join(checkpoint_dir, "training_state.pt"),
+            )
+
+    def load_checkpoint(self, checkpoint_path: str):
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        # FSDP checkpoint load via DCP.
+        if self.config.enable_fsdp and self.world_size > 1:
+            ok = self._load_checkpoint_dcp(checkpoint_path)
+            if ok and self.is_main_process:
+                logger.info(f"Resumed (DCP) from {checkpoint_path} at step {self.global_step}")
+            return
+
+        # Non-FSDP path: adapter (if present) + optimizer state.
+        lora_dir = os.path.join(checkpoint_path, "lora")
+        if os.path.exists(lora_dir) and self.config.use_lora:
+            self.student_transformer.load_lora_adapter(
+                pretrained_model_name_or_path_or_dict=lora_dir,
+                adapter_name="default",
+                use_safetensors=True,
+            )
+        state_path = os.path.join(checkpoint_path, "training_state.pt")
+        if os.path.exists(state_path):
+            state = torch.load(state_path, map_location=self.device)
+            self.optimizer.load_state_dict(state.get("optimizer", {}))
+            self.lr_scheduler.load_state_dict(state.get("lr_scheduler", {}))
+            self.global_step = state.get("global_step", 0)
+            if self.is_main_process:
+                logger.info(f"Resumed from {checkpoint_path} at step {self.global_step}")
+
+    def train(self, train_loader, val_loader=None):
+        if self.is_main_process:
+            logger.info("Starting training")
+        while self.global_step < self.config.max_train_steps:
+            pbar = None
+            if self.is_main_process and tqdm is not None:
+                pbar = tqdm(
+                    total=self.config.max_train_steps,
+                    initial=self.global_step,
+                    desc="train",
+                    dynamic_ncols=True,
+                    ascii=True,
+                )
+            try:
+                for batch in train_loader:
+                    if self.global_step >= self.config.max_train_steps:
+                        break
+                    metrics = self.train_step(batch)
+                    if self.global_step % self.config.log_every_steps == 0 and self.is_main_process:
+                        logger.info(
+                            f"step {self.global_step} | loss={metrics['loss_total']:.4f} "
+                            f"(distill={metrics['loss_distill']:.4f}, id={metrics['loss_id']:.4f}, "
+                            f"lambda_id={metrics['lambda_id']:.3f}) grad={metrics['grad_norm']:.4f} "
+                            f"lr={metrics['lr']:.2e}"
+                        )
+                    if self.config.enable_validation and self.global_step % self.config.val_every_steps == 0:
+                        self.validate(val_loader)
+                    self.global_step += 1
+                    if pbar is not None:
+                        pbar.update(1)
+                    if self.global_step % self.config.save_every_steps == 0:
+                        self.save_checkpoint(self.global_step)
+            finally:
+                if pbar is not None:
+                    pbar.close()
+        if self.config.enable_fsdp and self.world_size > 1:
+            self.save_checkpoint(self.global_step)
+        elif self.is_main_process:
+            self.save_checkpoint(self.global_step)
 
 
-def create_dummy_dataloader(config: TrainingConfig):
-    """
-    Create a dummy dataloader for testing.
-    
-    Note: This is a placeholder - users should implement their own dataloader
-    that loads actual video/image data. The dataloader should return batches with
-    the following format:
-    
-    Required fields:
-    - "pixel_values": torch.Tensor
-        * For video: shape [B, C, F, H, W] where F is the number of frames
-        * For image: shape [B, C, H, W] (will be automatically expanded to [B, C, 1, H, W])
-        * Pixel values must be in range [-1, 1]
-        * Data type: torch.float32
-        * Note: For video data, temporal dimension F must be 4n+1 (e.g., 1, 5, 9, 13, 17, 21, ...)
-          to satisfy VAE requirements. The dataset should ensure this before returning data.
-    
-    - "text": List[str]
-        * List of text prompts, one per sample in the batch
-        * Length should match batch size B
-    
-    - "data_type": str
-        * "video" for video data (supports both t2v and i2v tasks based on i2v_prob)
-        * "image" for image data (always uses t2v task)
-        * Can be a single string for the whole batch, or a list of strings (one per sample)
-    
-    Optional fields (for performance optimization):
-    - "latents": torch.Tensor, shape [B, C_latent, F, H_latent, W_latent]
-        * Pre-encoded VAE latents. If provided, pixel_values will be ignored and VAE encoding
-          will be skipped, significantly speeding up training.
-        * Should be in the same format as VAE encoder output (after scaling_factor applied)
-        * Temporal dimension F must still be 4n+1 for video data
-    
-    Optional fields (for byT5 text encoding):
-    - "byt5_text_ids": Optional[torch.Tensor], shape [B, seq_len]
-        * Pre-tokenized byT5 token IDs. If provided, will be used directly.
-        * If not provided, text will be tokenized on-the-fly.
-    
-    - "byt5_text_mask": Optional[torch.Tensor], shape [B, seq_len]
-        * Attention mask for byT5 tokens (1 for valid tokens, 0 for padding)
-        * Required if byt5_text_ids is provided
-    
-    Task type selection (automatic based on data_type and config.i2v_prob):
-    - For "video" data: randomly samples between t2v (text-to-video) and i2v (image-to-video)
-      based on config.i2v_prob probability
-    - For "image" data: always uses t2v task
-    
-    Example batch format:
-    {
-        "pixel_values": torch.Tensor([B, 3, 17, 256, 256]),  # Video example
-        "text": ["A cat playing", "A dog running"],
-        "data_type": "video",
-        "byt5_text_ids": torch.Tensor([B, 256]),  # Optional
-        "byt5_text_mask": torch.Tensor([B, 256]),  # Optional
-    }
-    
-    Or with pre-encoded latents (faster):
-    {
-        "latents": torch.Tensor([B, 16, 17, 32, 32]),  # Pre-encoded VAE latents
-        "text": ["A cat playing", "A dog running"],
-        "data_type": "video",
-    }
-    """
-    # This is a placeholder - users should implement their own dataloader
-    class DummyDataset:
-        def __init__(self, size=100):
-            self.size = size
-        
-        def __len__(self):
-            return self.size
-        
-        def __getitem__(self, idx):
-            # Video: temporal dimension must be 4n+1, using 17 frames
-            # Generate data in range [-1, 1]
-            data = torch.rand(3, 17, 64, 64) * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-            data_type = "video"
+def _build_wds_dataset(
+    root: str,
+    split: str,
+    metadata_key: str,
+    batch_size: int,
+    shuffle_buf: int,
+    seed: int,
+    p_secondary: float,
+    enable_secondary: bool,
+    secondary_cache_max_size: int,
+    enable_augmentation: bool,
+    augment_r: float,
+    augment_j: float,
+    reject_using_manifest: bool = True,
+) -> wds.DataPipeline:
+    shards = sorted(glob(os.path.join(root, "data", split, f"{split}-*.tar")))
+    if not shards:
+        raise FileNotFoundError(f"No shards found under {root}/data/{split}/{split}-*.tar")
 
-            return {
-                "pixel_values": data,
-                "text": "A sample prompt",
-                "data_type": data_type,
-                # "latents": torch.randn(3, 16, 17, 32, 32),
-                # "byt5_text_ids": torch.zeros((256), dtype=torch.int64),
-                # "byt5_text_mask": torch.zeros((256), dtype=torch.int64),
-            }
-    
-    dataset = DummyDataset()
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
+    manifest_path = os.path.join(root, "manifest", f"{split}_manifest.csv")
+    character_counts, min_count = _load_manifest_counts(manifest_path, metadata_key)
+
+    preprocess = _make_wds_preprocess_fn(
+        enable_augmentation=enable_augmentation,
+        augment_r=augment_r,
+        augment_j=augment_j,
+        base_seed=seed,
+        metadata_key=metadata_key,
     )
-    return dataloader
+    reject_fn = _make_inverse_freq_reject_fn(
+        character_counts=character_counts,
+        min_count=min_count,
+        base_seed=seed,
+        metadata_key=metadata_key,
+    )
+    secondary_mapper = _make_secondary_mapper(
+        p_secondary=p_secondary,
+        base_seed=seed,
+        enable_secondary=enable_secondary,
+        max_cache_size=secondary_cache_max_size,
+    )
+
+    if split == "train":
+        shard_source = wds.ResampledShards(shards, seed=seed)
+    else:
+        shard_source = wds.SimpleShardList(shards)
+
+    pipeline = [
+        shard_source,
+        wds.split_by_node,
+        wds.split_by_worker,
+        wds.tarfile_to_samples(),
+        wds.decode(_raw_pil_handler, "pil"),
+        wds.map_dict(json=lambda b: json.loads(b) if isinstance(b, (bytes, bytearray, str)) else b),
+        wds.to_tuple("jpg;jpeg;png;webp", "json"),
+        wds.map(preprocess),
+    ]
+
+    if reject_using_manifest:
+        pipeline.append(wds.select(reject_fn))
+
+    pipeline.append(wds.map(secondary_mapper))
+
+    if split == "train" and shuffle_buf and shuffle_buf > 0:
+        pipeline.append(wds.shuffle(shuffle_buf, initial=shuffle_buf))
+
+    pipeline.append(wds.batched(batch_size, collation_fn=identity_collate, partial=False))
+    return wds.DataPipeline(*pipeline)
+
+
+def create_dataloaders(config: TrainingConfig):
+    train_ds = _build_wds_dataset(
+        root=config.wds_root,
+        split="train",
+        metadata_key=config.metadata_key,
+        batch_size=config.batch_size,
+        shuffle_buf=config.wds_shuffle_buf,
+        seed=config.seed,
+        p_secondary=config.p_secondary,
+        enable_secondary=True,
+        secondary_cache_max_size=config.secondary_cache_max_size,
+        enable_augmentation=config.enable_augmentation,
+        augment_r=config.augment_r,
+        augment_j=config.augment_j,
+        reject_using_manifest=True,
+    )
+    train_loader = wds.WebLoader(
+        train_ds,
+        batch_size=None,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        persistent_workers=(config.num_workers > 0),
+    )
+
+    val_loader = None
+    if config.enable_validation:
+        val_ds = _build_wds_dataset(
+            root=config.wds_root,
+            split="val",
+            metadata_key=config.metadata_key,
+            batch_size=config.batch_size,
+            shuffle_buf=config.wds_shuffle_buf,
+            seed=config.seed + 999,
+            p_secondary=0.0,
+            enable_secondary=False,
+            secondary_cache_max_size=config.secondary_cache_max_size,
+            enable_augmentation=False,
+            augment_r=config.augment_r,
+            augment_j=config.augment_j,
+            reject_using_manifest=True,
+        )
+        val_loader = wds.WebLoader(
+            val_ds,
+            batch_size=None,
+            num_workers=max(1, config.num_workers // 2),
+            pin_memory=True,
+            persistent_workers=(max(1, config.num_workers // 2) > 0),
+        )
+
+    return train_loader, val_loader
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train HunyuanVideo-1.5 on video data")
-    
-    # Model paths
-    parser.add_argument("--pretrained_model_root", type=str, required=True, help="Path to pretrained model")
-    parser.add_argument("--pretrained_transformer_version", type=str, default="720p_t2v", help="Transformer version")
-    
-    # Training parameters
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--max_steps", type=int, default=10000, help="Maximum training steps")
-    parser.add_argument("--warmup_steps", type=int, default=500, help="Warmup steps")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm")
-    parser.add_argument("--train_timestep_shift", type=float, default=3.0, help="Train Timestep shift")
-    parser.add_argument("--flow_snr_type", type=str, default="lognorm", 
-                        choices=["uniform", "lognorm", "mix", "mode"],
-                        help="SNR type for flow matching: uniform, lognorm, mix, or mode (default: lognorm)")
-    
-    # Data parameters
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
-    
-    # Output parameters
-    parser.add_argument("--output_dir", type=str, default="./outputs", help="Output directory")
-    parser.add_argument("--save_interval", type=int, default=1000, help="Checkpoint save interval")
-    parser.add_argument("--log_interval", type=int, default=10, help="Logging interval")
-    
-    # Other parameters
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"], help="Data type")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--i2v_prob", type=float, default=0.3, help="Probability of i2v task for video data (default: 0.3)")
-    parser.add_argument("--use_muon", type=str_to_bool, nargs='?', const=True, default=True,
-        help="Use Muon optimizer for training (default: true). "
-             "Use --use_muon or --use_muon true/1 to enable, --use_muon false/0 to disable"
-    )
-    # FSDP and gradient checkpointing
+    parser = argparse.ArgumentParser(description="Distillation + DINO identity training for HunyuanVideo-1.5")
     parser.add_argument(
-        "--enable_fsdp", type=str_to_bool, nargs='?', const=True, default=True,
-        help="Enable FSDP for distributed training (default: true). "
-             "Use --enable_fsdp or --enable_fsdp true/1 to enable, --enable_fsdp false/0 to disable"
+        "--pipeline_dir",
+        type=str,
+        required=True,
+        help="Path containing the full pipeline (including text encoders and tokenizer).",
+    )
+    parser.add_argument("--transformer_version", type=str, default="480p_i2v", help="Transformer version to load")
+    parser.add_argument(
+        "--wds_root",
+        type=str,
+        required=True,
+        help="WebDataset root directory containing data/ and manifest/.",
     )
     parser.add_argument(
-        "--enable_gradient_checkpointing", type=str_to_bool, nargs='?', const=True, default=True,
-        help="Enable gradient checkpointing (default: true). "
-             "Use --enable_gradient_checkpointing or --enable_gradient_checkpointing true/1 to enable, "
-             "--enable_gradient_checkpointing false/0 to disable"
+        "--metadata_key",
+        type=str,
+        required=True,
+        help="Metadata key in WebDataset JSON and manifest CSV for character identifier.",
+    )
+    parser.add_argument("--wds_shuffle_buf", type=int, default=128, help="WebDataset shuffle buffer size")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--p_secondary", type=float, default=0.10)
+    parser.add_argument("--secondary_cache_max_size", type=int, default=128)
+    parser.add_argument("--enable_augmentation", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--augment_r", type=float, default=0.92)
+    parser.add_argument("--augment_j", type=float, default=0.04)
+    parser.add_argument("--train_target_resolution", type=str, default="480p")
+    parser.add_argument("--train_video_length", type=int, default=17)
+
+    parser.add_argument("--num_inference_steps", type=int, default=25)
+    parser.add_argument("--harvest_count", type=int, default=2)
+    parser.add_argument("--harvest_scheme", type=str, default="bracket")
+    parser.add_argument("--harvest_jitter_frac", type=float, default=0.05)
+    parser.add_argument("--id_timestep_frac_low", type=float, default=0.6)
+    parser.add_argument("--id_timestep_frac_high", type=float, default=0.85)
+    parser.add_argument("--id_num_frames", type=int, default=5)
+    parser.add_argument("--lambda_id", type=float, default=0.6)
+    parser.add_argument("--lambda_id_schedule", type=str, default="constant", choices=["constant", "linear", "cosine"])
+    parser.add_argument("--lambda_id_warmup_steps", type=int, default=500)
+    parser.add_argument("--id_every_steps", type=int, default=1, help="Compute identity loss every N steps (default 1).")
+    parser.add_argument(
+        "--id_decode_downsample_mode",
+        type=str,
+        default="false",
+        choices=["false", "area", "bicubic"],
+        help="Downsample x0 latents in H/W before VAE decode for identity loss.",
     )
     parser.add_argument(
-        "--sp_size", type=int, default=8,
-        help="Sequence parallelism size (default: 1). Must evenly divide world_size. "
-             "For example, if world_size=8, valid sp_size values are 1, 2, 4, 8."
+        "--id_decode_scale",
+        type=float,
+        default=0.5,
+        help="Scale factor for H/W downsampling in identity decode (e.g., 0.5).",
     )
-    
-    # Validation parameters
-    parser.add_argument("--validation_interval", type=int, default=100, help="Run validation every N steps (default: 100)")
-    parser.add_argument("--validation_prompts", type=str, nargs="+", default=None, 
-                        help="Prompts for validation (default: single default prompt). Can specify multiple prompts.")
-    parser.add_argument("--validation_timestep_shift", type=float, default=5.0, help="Validation Timestep shift")
-    parser.add_argument("--validate_video_length", type=int, default=241, help="Video length (number of frames) for validation (default: 241)")
-    
-    # Resume training parameters
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to checkpoint directory to resume training from (e.g., ./outputs/checkpoint-1000)")
-    
-    # LoRA parameters
-    parser.add_argument("--use_lora", type=str_to_bool, nargs='?', const=True, default=False,
-                        help="Enable LoRA training (default: false). "
-                             "Use --use_lora or --use_lora true/1 to enable, --use_lora false/0 to disable")
-    parser.add_argument("--lora_r", type=int, default=8,
-                        help="LoRA rank (default: 8)")
-    parser.add_argument("--lora_alpha", type=int, default=16,
-                        help="LoRA alpha scaling parameter (default: 16)")
-    parser.add_argument("--lora_dropout", type=float, default=0.0,
-                        help="LoRA dropout rate (default: 0.0)")
-    parser.add_argument("--lora_target_modules", type=str, nargs="+", default=None,
-                        help="Target modules for LoRA (default: all Linear layers). "
-                             "Example: --lora_target_modules img_attn_q img_attn_v img_mlp.fc1")
-    parser.add_argument("--pretrained_lora_path", type=str, default=None,
-                        help="Path to pretrained LoRA adapter to load. If provided, will load this adapter instead of creating a new one.")
-    
+
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--use_muon", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--max_train_steps", type=int, default=10000)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+
+    parser.add_argument("--use_lora", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--lora_target_modules", type=str, nargs="+", default=None)
+    parser.add_argument("--pretrained_lora_path", type=str, default=None)
+
+    parser.add_argument(
+        "--dino_model_dir",
+        type=str,
+        required=True,
+        help="Path to the local DINO backbone checkpoint directory.",
+    )
+    parser.add_argument(
+        "--dino_head_path",
+        type=str,
+        required=True,
+        help="Path to the projection head checkpoint for identity embeddings.",
+    )
+
+    parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--save_every_steps", type=int, default=1000)
+    parser.add_argument("--log_every_steps", type=int, default=10)
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"])
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--enable_validation", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--val_every_steps", type=int, default=1000)
+    parser.add_argument("--val_num_samples", type=int, default=4)
+    parser.add_argument("--val_video_length", type=int, default=60)
+
+    parser.add_argument("--enable_fsdp", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--enable_gradient_checkpointing", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--sp_size", type=int, default=8)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+
     args = parser.parse_args()
-    
+
     config = TrainingConfig(
-        pretrained_model_root=args.pretrained_model_root,
-        pretrained_transformer_version=args.pretrained_transformer_version,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        max_steps=args.max_steps,
-        warmup_steps=args.warmup_steps,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        max_grad_norm=args.max_grad_norm,
+        pipeline_dir=args.pipeline_dir,
+        transformer_version=args.transformer_version,
+        wds_root=args.wds_root,
+        wds_shuffle_buf=args.wds_shuffle_buf,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        output_dir=args.output_dir,
-        save_interval=args.save_interval,
-        log_interval=args.log_interval,
-        dtype=args.dtype,
-        seed=args.seed,
-        i2v_prob=args.i2v_prob,
-        enable_fsdp=args.enable_fsdp,
-        enable_gradient_checkpointing=args.enable_gradient_checkpointing,
-        sp_size=args.sp_size,
-        validation_interval=args.validation_interval,
-        validation_prompts=args.validation_prompts,
-        train_timestep_shift=args.train_timestep_shift,
-        validation_timestep_shift=args.validation_timestep_shift,
-        snr_type=SNRType(args.flow_snr_type),
-        validate_video_length=args.validate_video_length,
-        resume_from_checkpoint=args.resume_from_checkpoint,
+        p_secondary=args.p_secondary,
+        secondary_cache_max_size=args.secondary_cache_max_size,
+        metadata_key=args.metadata_key,
+        enable_augmentation=args.enable_augmentation,
+        augment_r=args.augment_r,
+        augment_j=args.augment_j,
+        train_target_resolution=args.train_target_resolution,
+        train_video_length=args.train_video_length,
+        num_inference_steps=args.num_inference_steps,
+        harvest_count=args.harvest_count,
+        harvest_scheme=args.harvest_scheme,
+        harvest_jitter_frac=args.harvest_jitter_frac,
+        id_timestep_frac_low=args.id_timestep_frac_low,
+        id_timestep_frac_high=args.id_timestep_frac_high,
+        id_num_frames=args.id_num_frames,
+        lambda_id=args.lambda_id,
+        lambda_id_schedule=args.lambda_id_schedule,
+        lambda_id_warmup_steps=args.lambda_id_warmup_steps,
+        id_every_steps=args.id_every_steps,
+        id_decode_downsample_mode=args.id_decode_downsample_mode,
+        id_decode_scale=args.id_decode_scale,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_grad_norm=args.max_grad_norm,
+        use_muon=args.use_muon,
+        max_train_steps=args.max_train_steps,
+        warmup_steps=args.warmup_steps,
         use_lora=args.use_lora,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
         pretrained_lora_path=args.pretrained_lora_path,
+        dino_model_dir=args.dino_model_dir,
+        dino_head_path=args.dino_head_path,
+        output_dir=args.output_dir,
+        save_every_steps=args.save_every_steps,
+        log_every_steps=args.log_every_steps,
+        dtype=args.dtype,
+        seed=args.seed,
+        enable_validation=args.enable_validation,
+        val_every_steps=args.val_every_steps,
+        val_num_samples=args.val_num_samples,
+        val_video_length=args.val_video_length,
+        enable_fsdp=args.enable_fsdp,
+        enable_gradient_checkpointing=args.enable_gradient_checkpointing,
+        sp_size=args.sp_size,
+        resume_from_checkpoint=args.resume_from_checkpoint,
     )
-    
+
     trainer = HunyuanVideoTrainer(config)
-    dataloader = create_dummy_dataloader(config)
-    trainer.train(dataloader)
+    train_loader, val_loader = create_dataloaders(config)
+    trainer.train(train_loader, val_loader)
 
 
 if __name__ == "__main__":
     main()
-

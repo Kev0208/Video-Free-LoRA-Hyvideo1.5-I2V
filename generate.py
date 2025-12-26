@@ -14,10 +14,44 @@
 # of rights and permissions under this agreement.
 # See the License for the specific language governing permissions and limitations under the License.
 
+"""
+HunyuanVideo-1.5 generation script (text-to-video or image-to-video).
+
+This script loads a base pipeline and optionally applies:
+- DCP checkpoints (full transformer weights), or
+- a LoRA adapter checkpoint.
+
+Example usage:
+  Base model (t2v):
+    torchrun --nproc_per_node=1 generate.py \
+      --prompt "A subject running across a snowy field." \
+      --resolution 480p \
+      --model_path /your/path/to/hunyuanvideo_pipeline \
+      --output_path ./outputs/base.mp4
+
+  DCP checkpoint (i2v):
+    torchrun --nproc_per_node=4 generate.py \
+      --prompt "Same subject, moving in wind." \
+      --image_path /your/path/to/ref.png \
+      --resolution 480p \
+      --model_path /your/path/to/hunyuanvideo_pipeline \
+      --checkpoint_path /your/path/to/checkpoint\
+      --output_path ./outputs/dcp.mp4
+
+  LoRA adapter:
+    torchrun --nproc_per_node=1 generate.py \
+      --prompt "Stylized motion, soft lighting." \
+      --resolution 480p \
+      --model_path /your/path/to/hunyuanvideo_pipeline \
+      --lora_path /your/path/to/lora_adapter \
+      --lora_r 16 --lora_alpha 16 --lora_scale 0.7 \
+      --output_path ./outputs/lora.mp4
+"""
+
 import os
 
-if 'PYTORCH_CUDA_ALLOC_CONF' not in os.environ:
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import copy
 import datetime
@@ -30,22 +64,45 @@ import einops
 import imageio
 from torch import distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.state_dict import get_model_state_dict
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
 from hyvideo.pipelines.hunyuan_video_pipeline import HunyuanVideo_1_5_Pipeline
 from hyvideo.commons.parallel_states import initialize_parallel_state
 from hyvideo.commons.infer_state import initialize_infer_state
 
-parallel_dims = initialize_parallel_state(sp=int(os.environ.get('WORLD_SIZE', '1')))
-torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
+_ = initialize_parallel_state(sp=int(os.environ.get("WORLD_SIZE", "1")))
+torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
 
-def save_video(video, path):
+DEFAULT_LORA_TARGETS = [
+    # MMDoubleStreamBlock
+    "img_attn_q",
+    "img_attn_k",
+    "img_attn_v",
+    "img_attn_proj",
+    "txt_attn_q",
+    "txt_attn_k",
+    "txt_attn_v",
+    "txt_attn_proj",
+    # MMSingleStreamBlock
+    "linear1_q",
+    "linear1_k",
+    "linear1_v",
+    "linear2.fc",
+    "linear1_mlp",
+    # Modulation / gating
+    "img_mod.linear",
+    "txt_mod.linear",
+    "modulation.linear",
+    "adaLN_modulation.1",
+]
+
+def save_video(video, path, fps=24):
     if video.ndim == 5:
         assert video.shape[0] == 1
         video = video[0]
     vid = (video * 255).clamp(0, 255).to(torch.uint8)
     vid = einops.rearrange(vid, 'c f h w -> f h w c')
-    imageio.mimwrite(path, vid, fps=24)
+    imageio.mimwrite(path, vid, fps=fps)
 
 def rank0_log(message, level):
     if int(os.environ.get('RANK', '0')) == 0:
@@ -75,14 +132,14 @@ def save_config(args, output_path, task, transformer_version):
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     
-    print(f"Saved generation config to: {config_path}")
+    rank0_log(f"Saved generation config to: {config_path}", "INFO")
     return config_path
 
 def str_to_bool(value):
     """Convert string to boolean, supporting true/false, 1/0, yes/no.
     If value is None (when flag is provided without value), returns True."""
     if value is None:
-        return True  # When --flag is provided without value, enable it
+        return True  
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -93,26 +150,52 @@ def str_to_bool(value):
             return False
     raise argparse.ArgumentTypeError(f"Boolean value expected, got: {value}")
 
+def _resolve_dcp_path(checkpoint_path):
+    if os.path.isdir(checkpoint_path):
+        if os.path.exists(os.path.join(checkpoint_path, ".metadata")):
+            return checkpoint_path
+        dcp_dir = os.path.join(checkpoint_path, "dcp")
+        if os.path.exists(os.path.join(dcp_dir, ".metadata")):
+            return dcp_dir
+    return checkpoint_path
+
+
 def load_checkpoint_to_transformer(pipe, checkpoint_path):
     
     if not os.path.exists(checkpoint_path):
         raise ValueError(f"Checkpoint path does not exist: {checkpoint_path}")
     
+    checkpoint_path = _resolve_dcp_path(checkpoint_path)
     if not os.path.exists(checkpoint_path):
         raise ValueError(f"Transformer checkpoint directory not found: {checkpoint_path}")
     
     rank0_log(f"Loading checkpoint from {checkpoint_path}", "INFO")
     
     try:
-        model_state_dict = get_model_state_dict(pipe.transformer)
         dcp.load(
-            state_dict={"model": model_state_dict},
+            state_dict={"model": pipe.transformer},
             checkpoint_id=checkpoint_path,
         )
         rank0_log("Transformer model state loaded successfully", "INFO")
     except Exception as e:
-        rank0_log(f"Error loading checkpoint: {e}", "ERROR")
-        raise
+        rank0_log(
+            f"Strict DCP load failed ({e}). Retrying with allow_partial_load=True.",
+            "WARNING",
+        )
+        try:
+            dcp.load(
+                state_dict={"model": pipe.transformer},
+                checkpoint_id=checkpoint_path,
+                planner=DefaultLoadPlanner(allow_partial_load=True),
+            )
+            rank0_log(
+                "Transformer model state loaded with allow_partial_load=True. "
+                "Missing keys were left at base model defaults.",
+                "WARNING",
+            )
+        except Exception:
+            rank0_log(f"Error loading checkpoint: {e}", "ERROR")
+            raise
 
 def load_lora_adapter(pipe, lora_path):
     rank0_log(f"Loading LoRA adapter from {lora_path}", "INFO")
@@ -128,6 +211,77 @@ def load_lora_adapter(pipe, lora_path):
     except Exception as e:
         rank0_log(f"Error loading LoRA adapter: {e}", "ERROR")
         raise
+
+
+def apply_lora_to_transformer(pipe, args):
+    if not args.use_lora:
+        return
+    from peft import LoraConfig
+
+    target_modules = args.lora_target_modules or DEFAULT_LORA_TARGETS
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="FEATURE_EXTRACTION",
+    )
+    pipe.transformer.add_adapter(lora_config, adapter_name="default")
+
+
+def apply_lora_scale(pipe, scale):
+    if scale is None:
+        return
+    try:
+        from peft.utils import other as peft_other
+        if hasattr(peft_other, "scale_lora_layers"):
+            peft_other.scale_lora_layers(pipe.transformer, scale)
+            rank0_log(f"Applied LoRA scale via peft.utils.other.scale_lora_layers: {scale}", "INFO")
+            return
+    except Exception:
+        pass
+
+    try:
+        from peft.tuners.lora import LoraLayer
+    except Exception:
+        LoraLayer = None
+
+    def _set_layer_scale(layer, adapter_name="default"):
+        scaling = getattr(layer, "scaling", None)
+        if isinstance(scaling, dict) and adapter_name in scaling:
+            r = layer.r.get(adapter_name) if isinstance(getattr(layer, "r", None), dict) else getattr(layer, "r", None)
+            alpha = (
+                layer.lora_alpha.get(adapter_name)
+                if isinstance(getattr(layer, "lora_alpha", None), dict)
+                else getattr(layer, "lora_alpha", None)
+            )
+            if r:
+                scaling[adapter_name] = float(alpha) / float(r) * float(scale)
+            else:
+                scaling[adapter_name] = float(scaling[adapter_name]) * float(scale)
+            return 1
+        if scaling is not None:
+            try:
+                layer.scaling = float(scaling) * float(scale)
+                return 1
+            except Exception:
+                return 0
+        return 0
+
+    updated = 0
+    for module in pipe.transformer.modules():
+        if LoraLayer is not None and isinstance(module, LoraLayer):
+            updated += _set_layer_scale(module)
+            continue
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B") and hasattr(module, "scaling"):
+            updated += _set_layer_scale(module)
+
+    if updated == 0:
+        rank0_log(
+            "LoRA scale requested but no LoRA layers were updated; adapter scaling may be unsupported.",
+            "WARNING",
+        )
     
 
 def generate_video(args):
@@ -136,9 +290,6 @@ def generate_video(args):
 
     if args.sparse_attn and args.use_sageattn:
         raise ValueError("sparse_attn and use_sageattn cannot be enabled simultaneously. Please enable only one of them.")
-    
-    # if args.enable_torch_compile:
-    #     torch._logging.set_logs(graph_code=True)
     
     if args.enable_step_distill and args.enable_cache:
         raise ValueError("Enabling both step distilled model and cache will lead to performance degradation.")
@@ -156,10 +307,8 @@ def generate_video(args):
     else:
         raise ValueError(f"Unsupported dtype: {args.dtype}. Must be 'bf16' or 'fp32'")
     
-    # Determine offloading settings
     enable_offloading = args.offloading
     if args.group_offloading is None:
-        # Auto-detect based on offloading config
         offloading_config = HunyuanVideo_1_5_Pipeline.get_offloading_config()
         enable_group_offloading = offloading_config['enable_group_offloading']
     else:
@@ -167,7 +316,6 @@ def generate_video(args):
     
     overlap_group_offloading = args.overlap_group_offloading
     
-    # Determine device and transformer_init_device based on offloading settings
     if enable_offloading:
         device = torch.device('cpu')
     else:
@@ -186,6 +334,8 @@ def generate_video(args):
         device=device,
         transformer_init_device=transformer_init_device,
     )
+
+    apply_lora_to_transformer(pipe, args)
     
     loguru.logger.info(f"{enable_offloading=} {enable_group_offloading=} {overlap_group_offloading=}")
     
@@ -196,14 +346,15 @@ def generate_video(args):
         overlap_group_offloading=overlap_group_offloading,
     )
     
-    # Load checkpoint if provided
     if args.checkpoint_path:
         load_checkpoint_to_transformer(pipe, args.checkpoint_path)
     
     if args.lora_path:
         load_lora_adapter(pipe, args.lora_path)
 
-    # Apply optimizations to SR pipeline if exists
+    if args.lora_scale is not None and (args.use_lora or args.lora_path):
+        apply_lora_scale(pipe, args.lora_scale)
+
     if enable_sr and hasattr(pipe, 'sr_pipeline'):
         sr_infer_state = copy.deepcopy(infer_state)
         sr_infer_state.enable_cache = False # SR pipeline does not require cache optimization yet
@@ -233,6 +384,7 @@ def generate_video(args):
         num_inference_steps=args.num_inference_steps,
         sr_num_inference_steps=None,
         video_length=args.video_length,
+        guidance_scale=args.guidance_scale,
         negative_prompt=args.negative_prompt,
         seed=args.seed,
         output_type="pt",
@@ -252,17 +404,17 @@ def generate_video(args):
         
         original_path = None
         if enable_sr and hasattr(out, 'sr_videos'):
-            save_video(out.sr_videos, output_path)
-            print(f"Saved SR video to: {output_path}")
+            save_video(out.sr_videos, output_path, fps=args.fps)
+            rank0_log(f"Saved SR video to: {output_path}", "INFO")
             
             if args.save_pre_sr_video:
                 base_path, ext = os.path.splitext(output_path)
                 original_path = f"{base_path}_before_sr{ext}"
-                save_video(out.videos, original_path)
-                print(f"Saved original video (before SR) to: {original_path}")
+                save_video(out.videos, original_path, fps=args.fps)
+                rank0_log(f"Saved original video (before SR) to: {original_path}", "INFO")
         else:
-            save_video(out.videos, output_path)
-            print(f"Saved video to: {output_path}")
+            save_video(out.videos, output_path, fps=args.fps)
+            rank0_log(f"Saved video to: {output_path}", "INFO")
         
         if args.save_generation_config:
             try:
@@ -298,8 +450,16 @@ def main():
         help='Number of inference steps (default: 50)'
     )
     parser.add_argument(
+        '--guidance_scale', type=float, default=None,
+        help='Classifier-free guidance scale (default: model config).'
+    )
+    parser.add_argument(
         '--video_length', type=int, default=121,
-        help='Number of frames to generate (default: 121)'
+        help='Total number of frames to generate (default: 121)'
+    )
+    parser.add_argument(
+        '--num_frames', type=int, default=None,
+        help='Alias for --video_length'
     )
     parser.add_argument(
         '--sr', type=str_to_bool, nargs='?', const=True, default=True,
@@ -314,7 +474,7 @@ def main():
     )
     parser.add_argument(
         '--rewrite', type=str_to_bool, nargs='?', const=True, default=False,
-        help='Enable prompt rewriting (default: true). '
+        help='Enable prompt rewriting (default: false). '
              'Use --rewrite or --rewrite true/1 to enable, --rewrite false/0 to disable'
     )
     parser.add_argument(
@@ -372,6 +532,10 @@ def main():
         help='Output file path for generated video (if not provided, saves to ./outputs/output.mp4)'
     )
     parser.add_argument(
+        '--fps', type=int, default=24,
+        help='Frames per second for saved video (default: 24)'
+    )
+    parser.add_argument(
         '--use_sageattn', type=str_to_bool, nargs='?', const=True, default=False,
         help='Enable sageattn (default: false). '
              'Use --use_sageattn or --use_sageattn true/1 to enable, '
@@ -425,8 +589,7 @@ def main():
     )
     parser.add_argument(
         '--checkpoint_path', type=str, default=None,
-        help='Path to checkpoint directory containing transformer weights (e.g., ./outputs/checkpoint-1000/transformer). '
-             'The checkpoint directory should contain a "transformer" subdirectory. '
+        help='Path to DCP checkpoint directory or its parent (e.g., ./outputs/checkpoint-1000 or ./outputs/checkpoint-1000/dcp). '
              'If provided, the transformer model weights will be loaded from this checkpoint.'
     )
     parser.add_argument(
@@ -434,10 +597,42 @@ def main():
         help='Path to LoRA adapter directory or checkpoint directory containing LoRA adapter. '
              'If provided, the LoRA adapter will be loaded to the transformer model.'
     )
+    parser.add_argument(
+        '--use_lora', type=str_to_bool, nargs='?', const=True, default=False,
+        help='Inject LoRA modules into the transformer before loading a DCP checkpoint '
+             '(default: false). Enable this if your checkpoint was trained with LoRA.'
+    )
+    parser.add_argument(
+        '--lora_r', type=int, default=16,
+        help='LoRA rank (default: 8)'
+    )
+    parser.add_argument(
+        '--lora_alpha', type=int, default=16,
+        help='LoRA alpha (default: 16)'
+    )
+    parser.add_argument(
+        '--lora_dropout', type=float, default=0.0,
+        help='LoRA dropout (default: 0.0)'
+    )
+    parser.add_argument(
+        '--lora_target_modules', type=str, nargs='+', default=None,
+        help='Target modules for LoRA injection. If omitted, uses the default list from training.'
+    )
+    parser.add_argument(
+        '--lora_scale', type=float, default=0.5,
+        help='LoRA adapter strength (default: 0.5). Requires --use_lora true or --lora_path.'
+    )
 
     args = parser.parse_args()
-    
-    # Convert string "none" to None for image_path
+
+    if args.num_frames is not None:
+        if args.video_length != args.num_frames:
+            rank0_log(
+                f"Overriding --video_length ({args.video_length}) with --num_frames ({args.num_frames}).",
+                "INFO",
+            )
+        args.video_length = args.num_frames
+
     if args.image_path is not None and args.image_path.lower().strip() == 'none':
         args.image_path = None
     
